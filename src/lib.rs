@@ -1,60 +1,57 @@
-use std::marker::PhantomData;
-use std::path::Path;
+use futures::future::BoxFuture;
+use futures::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite};
 use std::sync::Arc;
-use std::time::Duration;
-
-// Re-export of the File type so that it keeps parity with the
-// Dir type below.
-pub use std::fs::File;
-
-// Implementation that matches std::fs::Dir but in a way that does
-// not require nightly builds or special feature flags. When std::fs::Dir
-// becomes stable, then this can become a re-export like File above.
-pub struct Dir {}
-impl Dir {
-    // TODO: implement the stable methods
-}
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // This is currently a placeholder type that is generic. After more of the API is defined
 // and some of the implementation is done, we can turn this into more concrete types.
 type Error = Box<dyn std::error::Error>;
 
-// Claim should either be a File or a Dir?
-pub struct Claim<'a> {
-    _vault: Arc<VaultInner>,
-    _marker: PhantomData<&'a mut ()>,
+// This need to be flushed out more. It should work similar to the fs::Path in that
+// it's a hiearchy scoped, string repr of a way to get into a key. Should follow
+// newtype patterns where possible.
+pub struct Key; // TODO: flush this out more
+impl Key {
+    pub fn join(&self, other: &Key) -> &Self {
+        todo!("implement with signature similar to Path::join")
+    }
 }
 
-// The Vault is now Send so it can be moved across threads but a Claim has to be used locally.
-// Instead of sending a Claim, clone the Vault and then use `try_claim` on the local thread.
-//
+// Convenience type for defining generic async return types in the API layer. We do this
+// to ensure that support any async runtime can be implemented in the future.
+// pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub struct Claim {
+    store: Arc<dyn Store>,
+}
+
+// Claim instances are Send so ownership of the Claim can be transfered to
+// another thread.
+// They are not Sync in that a Claim refernce cannot be shared across threads.
+// This is done to ensure that there's only a single owner of a given Claim or
+// any of its subclaims.
 #[negative_impl::negative_impl]
-impl<'a> !Send for Claim<'a> {}
+impl !Sync for Claim {}
+unsafe impl Send for Claim {}
 
-impl<'a> Claim<'a> {
-    /// Create another Claim scoped to this claim or it's children. The returned
-    /// claim assumes the lifetime of the parent. The mutable borrow ensures that
-    /// the parent cannot be used while there is an outstanding subclaim.
-    #[must_use]
-    pub fn sub_claim<'b, P: AsRef<Path>>(&'b mut self, path: P) -> Result<Claim<'b>, Error> {
-        Ok(Claim {
-            // additional stuff
-            _vault: self._vault.clone(),
-            _marker: PhantomData,
-        })
+impl Claim {
+    // This is not pub since it should only be used by the Vault code
+    fn new(store: Arc<dyn Store>, _key: &Key) -> Self {
+        Self { store }
     }
 
-    /// Reference to the claim object as a file. Returns an Err if the path doesn't
-    /// point to a File object.
-    pub fn open(&self) -> Result<&File, Error> {
-        // TODO this should return the VaultFile trait
-        todo!("returns std::fs::File or tokio::fs::File depending on if this is async or not")
+    // what the user will use to list contents scoped to the key and children
+    pub fn list(&self, key: &Key) -> BoxFuture<'_, Result<&'_ [String], Error>> {
+        self.store.list(key)
     }
 
-    /// Reference to the claim object as a directory. Returns an Err if the path
-    /// doesn't point to a Dir object.
-    pub fn open_dir(&self) -> Result<&Dir, Error> {
-        todo!()
+    // what the user will use to delete an object
+    pub fn delete(&self, key: &Key) -> BoxFuture<'_, Result<(), Error>> {
+        self.store.delete(key)
+    }
+
+    // what the user will use to open an object for CRUD
+    pub fn open(&self, key: &Key) -> BoxFuture<'_, Result<Box<dyn StoreObject>, Error>> {
+        self.store.open(key)
     }
 
     /// Invalidates this Claim, which allows other call sites to claim
@@ -71,114 +68,106 @@ impl<'a> Claim<'a> {
     }
 }
 
-impl<'a> Drop for Claim<'a> {
+impl Drop for Claim {
     fn drop(&mut self) {
         let _ = self.release_impl();
     }
 }
 
-struct VaultInner {}
-impl VaultInner {
-    /// Creates and initializes a new Vault based on the `root` path. This needs to take
-    /// ownership of the directory at the OS level such that another Vault cannot be opened
-    /// with the same root.
-    fn new<P: AsRef<Path>>(root: P) -> Result<Self, Error> {
-        todo!()
+// ------------------------
+
+/// Interface required for any strategy for obtaining a claim to an object in
+/// the vault.
+pub trait Claimer: Send + Sync + 'static {
+    // Does the strategy specific logic to create a Claim that is bound to the store
+    // and scoped to key and its children. Returns an error if it can't obtain the
+    // exclusive claim object
+    fn try_claim<'a>(
+        &'a self,
+        store: Arc<dyn Store>,
+        key: &Key,
+    ) -> BoxFuture<'a, Result<Claim, Error>>;
+}
+
+pub trait StoreObject: AsyncRead + AsyncSeek + AsyncWrite {}
+
+// Interface required for any strategy used for storing the actual object data. Our first
+// implementation will be a file system but it could also be a database, object store or
+// in memroy.
+pub trait Store: Send + Sync + 'static {
+    /// Given a path, returns all of the objects that are children of the path in
+    /// a deep search. For file systems, this would be a recursive listing of all
+    /// the file paths. For other storage systems, path would be considered a matching
+    /// prefix.
+    fn list<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<&'a [String], Error>>;
+
+    /// Given a path to an item stored, deletes the object. Returns Ok() if there is
+    /// no object referenced by path.
+    fn delete<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<(), Error>>;
+
+    /// Given a path to an item stored, return a type that can read, write and seek
+    /// on the data for reading, writing, etc.
+    fn open<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<Box<dyn StoreObject>, Error>>;
+}
+
+/// Wraps a Store and prepends a defined key automatically
+pub struct ScopedStore {
+    base: Key,
+    inner: Arc<dyn Store>,
+}
+
+impl ScopedStore {
+    // todo: impement new
+}
+
+impl Store for ScopedStore {
+    fn delete<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<(), Error>> {
+        self.inner.delete(self.base.join(key))
     }
 
-    /// Attempts to lock either a directory (and conversely subdirectories) or
-    /// a single file, specified based on the `path`. Either returns the
-    /// Claim if it was able to establish it or returns why it can't. Does not
-    /// block and returns an appropriate `Err` if the `Claim` can't be obtained.
-    fn try_claim<P: AsRef<Path>>(&self, path: P) -> Result<Claim<'static>, Error> {
-        todo!()
+    fn list<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<&'a [String], Error>> {
+        self.inner.list(self.base.join(key))
     }
 
-    /// Disable issuing new Claims/Subclaims so that any shutdown logic can proceed with
-    /// some assurances that the file system is shutdown in a stable state. Blocks the calling
-    /// thread until all of the outstanding claims have been released.
-    fn shutdown_impl(&mut self) -> Result<(), Error> {
-        todo!()
+    fn open<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<Box<dyn StoreObject>, Error>> {
+        self.inner.open(self.base.join(key))
     }
 }
 
+// Handle to the thing the code will need.
 #[derive(Clone)]
-pub struct Vault(Arc<VaultInner>);
-impl Vault {
-    /// Creates and initializes a new Vault based on the `root` path.
-    pub fn new<P: AsRef<Path>>(root: P) -> Result<Self, Error> {
-        VaultInner::new(root).map(|v| Self(Arc::new(v)))
-    }
-
-    /// Attempts to lock either a directory (and conversely subdirectories) or
-    /// a single file, specified based on the `path`. Either returns the
-    /// Claim if it was able to establish it or returns why it can't. Does not
-    /// block and returns an appropriate `Err` if the `Claim` can't be obtained.
-    pub fn try_claim<P: AsRef<Path>>(&self, path: P) -> Result<Claim<'static>, Error> {
-        self.0.try_claim(path)
-    }
-
-    /// Attempts to lock either a directory (and conversely subdirectories) or
-    /// a single file, specified based on the `path`. Blocks the caller
-    /// until the `Claim` can be obtained or until timeout has elapsed.
-    pub fn claim<P: AsRef<Path>>(
-        &self,
-        path: P,
-        timeout: Duration,
-    ) -> Result<Claim<'static>, Error> {
-        todo!("implement using VaultInner::try_claim")
-    }
-
-    pub fn shutdown(self) {
-        let mut inner = self.0;
-        let _ = Arc::get_mut(&mut inner).map(VaultInner::shutdown_impl);
-    }
+pub struct Vault {
+    store: Arc<dyn Store>,
+    claimer: Arc<dyn Claimer>,
+    shutting_down: Arc<AtomicBool>,
 }
 
-mod test {
-    use super::*;
-    use std::io::Write;
-
-    fn init_scratchpad_dir(dir: &Dir) {
-        todo!()
+impl Vault {
+    /// Creates a new Vault given an implementation of a storage engine `store` and
+    /// a claim locking engine `claimer`.
+    pub fn new(store: impl Store, claimer: impl Claimer) -> Self {
+        Self {
+            store: Arc::new(store),
+            claimer: Arc::new(claimer),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        }
     }
 
-    fn init_artifact_dir(dir: &Dir) {
-        todo!()
+    /// Attempt to obtain a new claim from this vault's `Claimer` engine for a given
+    /// obhject path asychronously. This can result in either a valid `Claim` object, which
+    /// provides exclusive access to the path and it's subpaths. Can result in an error
+    /// if a claim cannot be obtained.
+    pub fn claim(&self, key: &Key) -> BoxFuture<'_, Result<Claim, Error>> {
+        if !self.shutting_down.load(Ordering::Relaxed) {
+            return self.claimer.try_claim(self.store.clone(), key);
+        }
+        todo!("return Err because we're shutting down")
     }
 
-    #[test]
-    fn basic_usage() -> Result<(), Error> {
-        let vault = Vault::new("~/vault")?;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                let mut session1 = vault.try_claim("session_123/agent_abc").unwrap();
-
-                let scratch_dir_claim = session1.sub_claim("scratchpad").unwrap();
-                let d1 = scratch_dir_claim.open_dir().unwrap();
-                init_scratchpad_dir(&d1);
-                scratch_dir_claim.release().unwrap();
-                // init_scratchpad_dir(&mut d1);  // this should fail to compile (and it does!)
-
-                let artifact_dir_claim = session1.sub_claim("artifacts").unwrap();
-                let d2 = artifact_dir_claim.open_dir().unwrap();
-                init_artifact_dir(&d2);
-                artifact_dir_claim.release().unwrap();
-                // init_artifact_dir(&d2); // this should fail to compile (and it does!)
-            });
-
-            s.spawn(|| {
-                let mut session2 = vault.try_claim("session_456/config.json").unwrap();
-
-                let config_file_claim = session2.sub_claim("config.json").unwrap();
-                let mut f = config_file_claim.open().unwrap();
-                write!(f, r#"{{}}"#).unwrap();
-
-                drop(config_file_claim);
-                // write!(f, r#"{{}}"#).unwrap(); // this should probably not compile (and it doesn't!)
-            });
-        });
-
-        Ok(())
+    /// Blocks until all outstanding claims have been released. Will prevent new Claims
+    /// from being issued.
+    pub async fn shutdown(self) {
+        self.shutting_down.store(true, Ordering::Relaxed);
+        todo!("wait for all Claims to have been released")
     }
 }
