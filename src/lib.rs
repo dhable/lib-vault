@@ -6,9 +6,27 @@ use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 use std::{fmt, future};
 
-// This is currently a placeholder type that is generic. After more of the API is defined
-// and some of the implementation is done, we can turn this into more concrete types.
-type Error = Box<dyn std::error::Error + Send + Sync>;
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    #[error("vault is shutting down")]
+    ShuttingDown,
+
+    #[error("invalid key")]
+    Key(#[from] KeyError),
+
+    #[error("{key} is already held by another claim")]
+    AlreadyClaimed { key: Key },
+
+    #[error("no object at {key}")]
+    NotFound { key: Key },
+
+    #[error("error obtaining a claim")]
+    ClaimError(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("vault store error")]
+    StoreError(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
 
 /// A hierarchical name for an object in a `Store`, in unix path syntax: components separated
 /// by `/`, e.g. `sessions/123/notes.md`.
@@ -468,7 +486,7 @@ impl Vault {
             // avoids a possible deadlock on a single threaded execution pool.
             let mut state = self.state.lock().expect("lock poisoned");
             if state.shutting_down {
-                return Err("todo return better error type".into());
+                return Err(Error::ShuttingDown);
             }
             state.outstanding_claims += 1;
             Claim::new(self.store.clone(), key.clone(), self.state.clone())
