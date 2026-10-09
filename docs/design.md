@@ -522,8 +522,11 @@ Async is the base API (D33), not a later addition. Notes carried over from the o
 
 ## 12. Workspace and module layout
 
-The repository is a Cargo workspace (D49). The root `Cargo.toml` lists the members; `docs/`,
-`Cargo.lock` and `target/` are shared at the root.
+The repository is a Cargo workspace (D49). The root `Cargo.toml` lists the members,
+declares the shared package `version` and `edition` in `[workspace.package]`, and declares all
+third-party dependencies in `[workspace.dependencies]`; member crates inherit both with
+`.workspace = true` (D50). `docs/`, `Cargo.lock` and `target/` are shared at the
+root.
 
 | Crate | Contents |
 |---|---|
