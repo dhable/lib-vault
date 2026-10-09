@@ -59,7 +59,8 @@ Rust code. Security enforcement lives in key validation (§3) and in each backen
    with a held claim. It never sees the store.
 4. On success the vault stores the lock in the claim (`set_lock`) and returns it. On an error,
    or if the `claim()` future is dropped, the lock-less claim is dropped and gives its count back.
-5. The claim's operations take keys **relative to the claimed key**, and can't leave its subtree.
+5. The claim's operations take an `Option<&Key>` **relative to the claimed key**: `None` is the
+   claimed key itself, `Some(k)` a key beneath it. They can't leave the claim's subtree (D48).
 6. `claim.release()` releases the lock and returns any error; dropping the claim releases it if
    that hasn't happened (errors are logged) and decrements the outstanding count, so `shutdown`
    can finish.
@@ -74,22 +75,26 @@ things a vault must not (absolute paths, `..`, OS-specific syntax).
 
 - **Syntax** (D34): unix-like, components separated by `/`. Strictly canonical, so each key has
   exactly one spelling:
-  - `""` is the root key (the whole scope it's applied to);
+  - not empty: there is no root key (D48);
   - no leading or trailing `/`, no empty components (`a//b`);
   - no `.` or `..` components;
   - no NUL bytes.
-  Anything else is rejected with a `KeyError` (`LeadingSlash`, `TrailingSlash`,
+  Anything else is rejected with a `KeyError` (`Empty`, `LeadingSlash`, `TrailingSlash`,
   `EmptyComponent`, `DotComponent`, `Nul`). Nothing is normalized.
 - **Representation**: `Key(Arc<str>)`. Cloning is a refcount bump, so a `Store` can clone a
   `&Key` into a `'static` future rather than borrowing it.
 - **`join(&self, &Key) -> Key`** (D35): infallible, because both sides are already canonical.
-  Unlike `Path::join`, the argument never replaces the base; the result always starts with
-  `self`. Root on either side returns the other key.
-- **Component-wise helpers**: `components`, `starts_with` (`a/bc` does *not* start with `a/b`),
-  `strip_prefix`, `parent`, `object_name` (the last component). Claimers use `starts_with` for
-  overlap checks; stores use `strip_prefix` to return keys relative to the listed key.
-- **Constructors and conversions**: `Key::new`, `Key::root`, `FromStr`, `TryFrom<&str>`,
-  `TryFrom<String>`, `AsRef<str>`, `Display`.
+  Unlike `Path::join`, the argument never replaces the base: `a` joined with `b/c` is always
+  `a/b/c`, beneath `self`.
+- **Component-wise helpers**: `components`, `starts_with` (`a/bc` does *not* start with `a/b`;
+  a key starts with itself), `strip_prefix` (`a/b/c` minus `a` is `b/c`; a key minus itself is
+  `None`), `parent` (`None` for a single-component key), `object_name` (the last component;
+  always `Some`). Claimers use `starts_with` for overlap checks; stores use `strip_prefix` to
+  return keys relative to the listed key.
+- **Constructors and conversions**: `Key::new`, `FromStr`, `TryFrom<&str>`, `TryFrom<String>`,
+  `AsRef<str>`, `Display`. There is no `Key::root`.
+- **Naming the claim itself** (D48): since there's no empty key, the whole vault can't be
+  claimed, and a claim refers to its own key with `None` (§4.1).
 - The portable name policy (§10) is enforced by the filesystem backend today. Moving it into
   `Key` for every backend is open (P38).
 
@@ -99,7 +104,12 @@ things a vault must not (absolute paths, `..`, OS-specific syntax).
 A claim on `k` can touch `k` and its descendants and nothing else. `Claim::new` wraps the
 vault's store in `ScopedStore::new(k, store)`: every key the claim receives is joined beneath
 `k`, and since keys can't contain `..` and `join` only nests, there's no way out.
-`claim.delete(&Key::root())` deletes the claimed object itself.
+
+Claim operations take `Option<&Key>` (D48). `Claim` holds the `ScopedStore` and resolves the
+argument with `ScopedStore::resolve`: `None` → `k`, `Some(x)` → `k.join(x)`. It then calls the
+inner `Store` with that full key, so backends never see an optional or empty key. So
+`claim.delete(None)` deletes the claimed object itself, and `claim.list(None)` lists everything
+in the claim.
 
 ### 4.2 Ownership and threads (D37)
 - `Claim` is `Send`: it can be moved to another thread or into a spawned task. This is
@@ -117,8 +127,8 @@ vault's store in `ScopedStore::new(k, store)`: every key the claim receives is j
 pub type ObjectReader<'a> = Pin<Box<dyn AsyncRead + Send + 'a>>;
 pub type ObjectWriter<'a> = Pin<Box<dyn AsyncWrite + Send + 'a>>;
 
-pub async fn open_read<'a>(&'a mut self, key: &Key) -> Result<ObjectReader<'a>, Error>;
-pub async fn open_write<'a>(&'a mut self, key: &Key) -> Result<ObjectWriter<'a>, Error>;
+pub async fn open_read<'a>(&'a mut self, key: Option<&Key>) -> Result<ObjectReader<'a>, Error>;
+pub async fn open_write<'a>(&'a mut self, key: Option<&Key>) -> Result<ObjectWriter<'a>, Error>;
 ```
 - **Pinned and boxed** so the `futures` extension methods (`read_to_end`, `write_all`, …) work
   whether or not a backend's reader is `Unpin`; **`Send`** so tasks holding one stay spawnable.
@@ -211,6 +221,9 @@ pub trait Store: Send + Sync + 'static {
     fn open_write<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<ObjectWriter<'a>, Error>>;
 }
 ```
+Every key a `Store` receives is a full, non-empty key; `Claim` resolves its optional,
+claim-relative keys before calling the store (D48).
+
 Object semantics (D43):
 - **`list`** (D40): everything beneath `key`, as keys relative to `key`; "beneath" is
   component-wise. No paging or limits in the first revision.
@@ -237,7 +250,7 @@ These are documented on the traits in `src/lib.rs`:
   vault builds the `Claim`.
 - **Exclusion** (D44, resolves P36): a claim on `k` covers `k` and every key beneath it,
   compared component-wise (`Key::starts_with`). While `a/b` is held, `try_lock` refuses `a/b`,
-  any descendant (`a/b/c`) and any ancestor (`a`, the root `""`). Disjoint keys (`a/b`, `a/c`)
+  any descendant (`a/b/c`) and any ancestor (`a`). Disjoint keys (`a/b`, `a/c`)
   don't conflict. Exclusion holds between all holders sharing the backing storage: tasks,
   threads, other `Vault`s in the process, other processes. A claimer that only sees its own
   process says so.
@@ -253,20 +266,27 @@ These are documented on the traits in `src/lib.rs`:
 - **`ClaimLock::release`** is synchronous and non-blocking; the implementation handles any
   async work itself. It returns `Ok` only once the key can be claimed again immediately (D39,
   §4.4). It's called from `Claim::release` or `Claim::drop`.
-- The `try_lock` docs still link to the removed `ClaimLock::try_release` (`cargo doc` warns).
 
 ## 7. Public API
 
 Final sketch (`src/lib.rs`), abbreviated:
 
 ```rust
-type Error = Box<dyn std::error::Error + Send + Sync>;   // placeholder (D12, P4)
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {                                          // D12
+    ShuttingDown,
+    Key(#[from] KeyError),
+    AlreadyClaimed { key: Key },
+    NotFound { key: Key },
+    ClaimError(#[source] Box<dyn std::error::Error + Send + Sync>),
+    StoreError(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key(Arc<str>);                                 // §3
 impl Key {
     pub fn new(s: &str) -> Result<Key, KeyError>;
-    pub fn root() -> Key;
     pub fn join(&self, other: &Key) -> Key;
     pub fn starts_with(&self, base: &Key) -> bool;
     pub fn strip_prefix(&self, base: &Key) -> Option<Key>;
@@ -286,12 +306,13 @@ impl Vault {
     pub async fn shutdown(self);
 }
 
-pub struct Claim { store: Arc<dyn Store>, lock: Option<Box<dyn ClaimLock>>, state: Arc<Mutex<VaultState>> }
+pub struct Claim { store: ScopedStore, lock: Option<Box<dyn ClaimLock>>, state: Arc<Mutex<VaultState>> }
 impl Claim {                                              // Send, never Clone
-    pub async fn list(&mut self, prefix: &Key) -> Result<Vec<Key>, Error>;
-    pub async fn delete(&mut self, key: &Key) -> Result<(), Error>;
-    pub async fn open_read<'a>(&'a mut self, key: &Key) -> Result<ObjectReader<'a>, Error>;
-    pub async fn open_write<'a>(&'a mut self, key: &Key) -> Result<ObjectWriter<'a>, Error>;
+    // `None` = the claimed key itself (D48)
+    pub async fn list(&mut self, prefix: Option<&Key>) -> Result<Vec<Key>, Error>;
+    pub async fn delete(&mut self, key: Option<&Key>) -> Result<(), Error>;
+    pub async fn open_read<'a>(&'a mut self, key: Option<&Key>) -> Result<ObjectReader<'a>, Error>;
+    pub async fn open_write<'a>(&'a mut self, key: Option<&Key>) -> Result<ObjectWriter<'a>, Error>;
     pub fn release(&mut self) -> Result<(), Error>;
 }
 impl Drop for Claim { /* self.release() (errors logged), then count down */ }
@@ -307,13 +328,11 @@ trait using `async fn` can't be used as `dyn Trait` and can't promise its future
 An `async fn`'s `Send`-ness is inferred, so it can be lost silently (as the v6 `claim`, which
 held a `MutexGuard` across `.await`, showed); §13 asserts it.
 
-**Build status:** builds; the 11 unit tests pass, including a compile-time `Claim: Send`
-check; the `Claim::list` example is `ignore`d. Known leftovers:
-- `cargo doc` warns about the dead `ClaimLock::try_release` link in the `try_lock` docs (a
-  `REVIEW(nit)` comment above it says so);
-- the `futures` `executor` feature in `Cargo.toml` is no longer used;
+**Build status:** builds; the 10 unit tests pass, including a compile-time `Claim: Send`
+check; `cargo doc` is clean; the `Claim::list` example is `ignore`d. Known leftovers:
+- a stale `REVIEW(nit)` comment above the `try_lock` docs (what it flags is fixed);
 - the test playground's `MemStore`/`MemClaimer` give unused-variable and dead-code warnings;
-- the "shutting down" error is a placeholder string (P4); doc comments have some typos.
+- doc comments have some typos.
 
 **History.** v9 made `ClaimLock::release` synchronous (it was a `BoxFuture` run with `block_on`
 in `Drop` in v6–v8) and turned `Claim::release` into a sync `&mut self` method (an
@@ -473,7 +492,7 @@ Async is the base API (D33), not a later addition. Notes carried over from the o
 | Module | Contents |
 |---|---|
 | `lib.rs` | re-exports; `tracing` spans/events for diagnostics (D26) |
-| `error.rs` | error type (P4) |
+| `error.rs` | `Error` enum (D12) |
 | `key.rs` | `Key`, `KeyError` |
 | `vault.rs` | `Vault`, `VaultState` (shutdown flag, outstanding count, waiters) |
 | `claim.rs` | `Claim`, release / `Drop` |
@@ -486,7 +505,7 @@ Async is the base API (D33), not a later addition. Notes carried over from the o
 ## 13. Verification strategy
 
 - **`Key`** (done, unit tests in `src/lib.rs`): canonical keys accepted, each rejection case,
-  join with root on either side, join associativity, join always nests, component-wise
+  the empty key rejected, join associativity, join always nests, component-wise
   `starts_with`/`strip_prefix`, `parent`/`object_name`, parse/display round trip.
 - **Compile-time checks**: `Claim: Send` (done), `Vault: Send + Sync + Clone`, and that the futures
   of `Vault::claim`, `Vault::shutdown` and a typical claim-using `async` block that holds a

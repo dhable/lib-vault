@@ -33,7 +33,7 @@ pub enum Error {
 ///
 /// Keys are always relative to some scope (a `Store`, or a `Claim`'s key) and are strictly
 /// canonical, so each key has exactly one spelling:
-/// - the empty string is the root key (the scope itself);
+/// - not empty (a `Claim` names its own key with `None` instead);
 /// - no leading or trailing `/`, and no empty components (`a//b`);
 /// - no `.` or `..` components, so a key can never name something outside its scope;
 /// - no NUL bytes.
@@ -46,6 +46,8 @@ pub struct Key(Arc<str>);
 /// Why a string was rejected by `Key::new`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyError {
+    /// The empty string. There is no root key.
+    Empty,
     /// Starts with `/`. Keys are always relative to their scope.
     LeadingSlash,
     /// Ends with `/`.
@@ -61,6 +63,7 @@ pub enum KeyError {
 impl fmt::Display for KeyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
+            KeyError::Empty => "key must not be empty",
             KeyError::LeadingSlash => "key must not start with '/'",
             KeyError::TrailingSlash => "key must not end with '/'",
             KeyError::EmptyComponent => "key must not contain empty components ('//')",
@@ -80,20 +83,11 @@ impl Key {
         Ok(Self(Arc::from(s)))
     }
 
-    /// The root key: the whole scope it is applied to.
-    pub fn root() -> Self {
-        Self(Arc::from(""))
-    }
-
-    pub fn is_root(&self) -> bool {
-        self.0.is_empty()
-    }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// Iterates over the `/`-separated components. The root key has none.
+    /// Iterates over the `/`-separated components.
     pub fn components(&self) -> impl DoubleEndedIterator<Item = &str> {
         self.0.split('/').filter(|c| !c.is_empty())
     }
@@ -102,50 +96,38 @@ impl Key {
     ///
     /// Unlike `Path::join`, `other` can never replace `self`: keys are always relative, so
     /// the result is always `self` or something beneath it. `ScopedStore` relies on this to
-    /// keep callers inside their scope. Joining with the root key on either side returns
-    /// the other key unchanged.
+    /// keep callers inside their scope.
     pub fn join(&self, other: &Key) -> Key {
-        if self.is_root() {
-            other.clone()
-        } else if other.is_root() {
-            self.clone()
-        } else {
-            Key(Arc::from(format!("{}/{}", self.0, other.0)))
-        }
+        Key(Arc::from(format!("{}/{}", self.0, other.0)))
     }
 
     /// True if `base` is `self` or one of its ancestors. Compares whole components, so
-    /// `a/bc` does not start with `a/b`. Every key starts with the root key.
+    /// `a/bc` does not start with `a/b`.
     pub fn starts_with(&self, base: &Key) -> bool {
         self.strip_prefix_str(base).is_some()
     }
 
-    /// Returns `self` relative to `base`, or `None` if `base` isn't `self` or an ancestor.
-    /// `a/b/c` stripped of `a` is `b/c`; a key stripped of itself is the root key.
+    /// Returns `self` relative to `base`, or `None` if `base` isn't a proper ancestor.
+    /// `a/b/c` stripped of `a` is `b/c`; a key stripped of itself is `None`.
     pub fn strip_prefix(&self, base: &Key) -> Option<Key> {
-        self.strip_prefix_str(base).map(|rest| Key(Arc::from(rest)))
+        self.strip_prefix_str(base)
+            .filter(|rest| !rest.is_empty())
+            .map(|rest| Key(Arc::from(rest)))
     }
 
-    /// The key one level up, or `None` for the root key. The parent of `a` is the root key.
+    /// The key one level up, or `None` for a single-component key.
     pub fn parent(&self) -> Option<Key> {
-        if self.is_root() {
-            return None;
-        }
-        Some(match self.0.rsplit_once('/') {
-            Some((parent, _)) => Key(Arc::from(parent)),
-            None => Key::root(),
-        })
+        self.0
+            .rsplit_once('/')
+            .map(|(parent, _)| Key(Arc::from(parent)))
     }
 
-    /// The last component, or `None` for the root key.
+    /// The last component. Always `Some` now that keys can't be empty.
     pub fn object_name(&self) -> Option<&str> {
         self.components().next_back()
     }
 
     fn strip_prefix_str(&self, base: &Key) -> Option<&str> {
-        if base.is_root() {
-            return Some(&self.0);
-        }
         match self.0.strip_prefix(&*base.0)? {
             "" => Some(""),
             rest => rest.strip_prefix('/'),
@@ -154,7 +136,7 @@ impl Key {
 
     fn validate(s: &str) -> Result<(), KeyError> {
         if s.is_empty() {
-            return Ok(());
+            return Err(KeyError::Empty);
         }
         if s.contains('\0') {
             return Err(KeyError::Nul);
@@ -230,7 +212,7 @@ pub type ObjectWriter<'a> = Pin<Box<dyn AsyncWrite + Send + 'a>>;
 /// reference to use any method on the `Claim`. It does not mean that every method changes the
 /// state of the object.
 pub struct Claim {
-    store: Arc<dyn Store>,
+    store: ScopedStore,
     lock: Option<Box<dyn ClaimLock>>,
     state: Arc<Mutex<VaultState>>,
 }
@@ -239,7 +221,7 @@ impl Claim {
     // Create a new claim instance with the `Store` keys scoped to `base`. Intended
     // to be used by `Vault` to create a claim after a claim's lock is obtained.
     fn new(store: Arc<dyn Store>, base: Key, state: Arc<Mutex<VaultState>>) -> Self {
-        let store = Arc::new(ScopedStore::new(base, store));
+        let store = ScopedStore::new(base, store);
         let lock = None;
         Self { store, lock, state }
     }
@@ -260,25 +242,33 @@ impl Claim {
     /// Example:
     /// ```ignore
     ///    let claim = vault.claim(Key::new("top")?)?;
-    ///    let list = claim.list(Key::new("parent")?)?;
+    ///    let list = claim.list(Some(&Key::new("parent")?))?;
     /// ```
     /// Would list all the objects that have keys that are children of `top/parent`.
-    pub async fn list(&mut self, prefix: &Key) -> Result<Vec<Key>, Error> {
-        self.store.list(prefix).await
+    /// `None` lists everything in the claim.
+    pub async fn list(&mut self, prefix: impl Into<Option<&Key>>) -> Result<Vec<Key>, Error> {
+        let prefix = prefix.into();
+        self.store.inner.list(&self.store.resolve(prefix)).await
     }
 
     /// Deletes a specific object stored at `base` + `key`. Calling this method with a
     /// key that does not exist in the store is considered a successful delete operation.
     /// This behavior matches the semantics of the HTTP DELETE method.
-    pub async fn delete(&mut self, key: &Key) -> Result<(), Error> {
-        self.store.delete(key).await
+    /// `None` means the claimed key itself.
+    pub async fn delete(&mut self, key: impl Into<Option<&Key>>) -> Result<(), Error> {
+        let key = key.into();
+        self.store.inner.delete(&self.store.resolve(key)).await
     }
 
     /// Opens a specific object at `base` + `key` for reading. The resulting reader is valid
     /// for the duration of the claim. Reading a key that does not point an object will return
-    /// an error.
-    pub async fn open_read<'a>(&'a mut self, key: &Key) -> Result<ObjectReader<'a>, Error> {
-        self.store.open_read(key).await
+    /// an error. `None` means the claimed key itself.
+    pub async fn open_read<'a>(
+        &'a mut self,
+        key: impl Into<Option<&Key>>,
+    ) -> Result<ObjectReader<'a>, Error> {
+        let key = key.into();
+        self.store.inner.open_read(&self.store.resolve(key)).await
     }
 
     /// Opens a specific object at `base` + `key` for writing. The specific beahviors around when
@@ -288,8 +278,13 @@ impl Claim {
     ///
     /// Writing to a key pointing at an existing object should overwrite the exiting object data.
     /// Writing to a key that does not have an object will create the object with the given key.
-    pub async fn open_write<'a>(&'a mut self, key: &Key) -> Result<ObjectWriter<'a>, Error> {
-        self.store.open_write(key).await
+    /// `None` means the claimed key itself.
+    pub async fn open_write<'a>(
+        &'a mut self,
+        key: impl Into<Option<&Key>>,
+    ) -> Result<ObjectWriter<'a>, Error> {
+        let key = key.into();
+        self.store.inner.open_write(&self.store.resolve(key)).await
     }
 
     /// Releases the underyling Claim lock issued when the Claim was created. This method exposes
@@ -355,7 +350,7 @@ pub trait ClaimLock: Send {
 /// held, `try_lock` must refuse all of:
 /// - `a/b` itself;
 /// - any descendant, such as `a/b/c`;
-/// - any ancestor, such as `a` or the root key `""`.
+/// - any ancestor, such as `a`.
 ///
 /// Disjoint keys such as `a/b` and `a/c` must not conflict.
 ///
@@ -426,6 +421,11 @@ impl ScopedStore {
     /// nest, callers of the scoped store can't reach anything outside `base`.
     pub fn new(base: Key, inner: Arc<dyn Store>) -> Self {
         Self { base, inner }
+    }
+
+    // The full key for an optional key relative to `base`; `None` is `base` itself.
+    fn resolve(&self, key: Option<&Key>) -> Key {
+        key.map_or_else(|| self.base.clone(), |k| self.base.join(k))
     }
 }
 
@@ -608,7 +608,6 @@ mod tests {
         #[test]
         fn accepts_canonical_keys() {
             for s in [
-                "",
                 "a",
                 "a/b",
                 "sessions/123/notes.md",
@@ -623,6 +622,7 @@ mod tests {
         #[test]
         fn rejects_non_canonical_keys() {
             let cases = [
+                ("", KeyError::Empty),
                 ("/", KeyError::LeadingSlash),
                 ("/a", KeyError::LeadingSlash),
                 ("a/", KeyError::TrailingSlash),
@@ -641,21 +641,9 @@ mod tests {
         }
 
         #[test]
-        fn root() {
-            assert!(Key::root().is_root());
-            assert_eq!(Key::root(), key(""));
-            assert_eq!(Key::root().components().count(), 0);
-            assert_eq!(Key::root().parent(), None);
-            assert_eq!(Key::root().object_name(), None);
-        }
-
-        #[test]
         fn join() {
             assert_eq!(key("a").join(&key("b/c")), key("a/b/c"));
             assert_eq!(key("a/b").join(&key("c")), key("a/b/c"));
-            assert_eq!(Key::root().join(&key("a")), key("a"));
-            assert_eq!(key("a").join(&Key::root()), key("a"));
-            assert_eq!(Key::root().join(&Key::root()), Key::root());
 
             let (a, b, c) = (key("a"), key("b/x"), key("c"));
             assert_eq!(a.join(&b).join(&c), a.join(&b.join(&c)));
@@ -664,7 +652,7 @@ mod tests {
         #[test]
         fn join_always_nests() {
             let base = key("scope");
-            for other in ["", "a", "a/b", "scope", "x/scope"] {
+            for other in ["a", "a/b", "scope", "x/scope"] {
                 assert!(base.join(&key(other)).starts_with(&base), "{other:?}");
             }
         }
@@ -680,24 +668,21 @@ mod tests {
         fn starts_with_compares_components() {
             assert!(key("a/b/c").starts_with(&key("a/b")));
             assert!(key("a/b").starts_with(&key("a/b")));
-            assert!(key("a").starts_with(&Key::root()));
             assert!(!key("a/bc").starts_with(&key("a/b")));
             assert!(!key("a").starts_with(&key("a/b")));
-            assert!(!Key::root().starts_with(&key("a")));
         }
 
         #[test]
         fn strip_prefix() {
             assert_eq!(key("a/b/c").strip_prefix(&key("a")), Some(key("b/c")));
-            assert_eq!(key("a/b").strip_prefix(&key("a/b")), Some(Key::root()));
-            assert_eq!(key("a/b").strip_prefix(&Key::root()), Some(key("a/b")));
+            assert_eq!(key("a/b").strip_prefix(&key("a/b")), None);
             assert_eq!(key("a/bc").strip_prefix(&key("a/b")), None);
         }
 
         #[test]
         fn parent_and_object_name() {
             assert_eq!(key("a/b/c").parent(), Some(key("a/b")));
-            assert_eq!(key("a").parent(), Some(Key::root()));
+            assert_eq!(key("a").parent(), None);
             assert_eq!(key("a/b/c").object_name(), Some("c"));
             assert_eq!(key("a").object_name(), Some("a"));
         }
