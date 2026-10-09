@@ -170,6 +170,12 @@ impl fmt::Display for Key {
     }
 }
 
+impl From<&Key> for Key {
+    fn from(value: &Key) -> Self {
+        value.clone()
+    }
+}
+
 impl FromStr for Key {
     type Err = KeyError;
 
@@ -192,6 +198,30 @@ impl TryFrom<String> for Key {
     fn try_from(s: String) -> Result<Self, Self::Error> {
         Key::validate(&s)?;
         Ok(Key(Arc::from(s)))
+    }
+}
+
+/// Anything a `Claim` method accepts as a key relative to the claim: `&str` (validated with
+/// `Key::new`), `&Key`, or `Option<&Key>` (`None` means the claimed key itself).
+pub trait AsKeyRef {
+    fn into_key(self) -> Result<Option<Key>, KeyError>;
+}
+
+impl AsKeyRef for &str {
+    fn into_key(self) -> Result<Option<Key>, KeyError> {
+        Key::new(self).map(Some)
+    }
+}
+
+impl AsKeyRef for &Key {
+    fn into_key(self) -> Result<Option<Key>, KeyError> {
+        Ok(Some(self.clone()))
+    }
+}
+
+impl AsKeyRef for Option<&Key> {
+    fn into_key(self) -> Result<Option<Key>, KeyError> {
+        Ok(self.cloned())
     }
 }
 
@@ -242,22 +272,24 @@ impl Claim {
     /// Example:
     /// ```ignore
     ///    let claim = vault.claim(Key::new("top")?)?;
-    ///    let list = claim.list(Some(&Key::new("parent")?))?;
+    ///    let list = claim.list("parent").await?;
     /// ```
     /// Would list all the objects that have keys that are children of `top/parent`.
     /// `None` lists everything in the claim.
-    pub async fn list(&mut self, prefix: impl Into<Option<&Key>>) -> Result<Vec<Key>, Error> {
-        let prefix = prefix.into();
-        self.store.inner.list(&self.store.resolve(prefix)).await
+    pub async fn list(&mut self, prefix: impl AsKeyRef) -> Result<Vec<Key>, Error> {
+        let prefix = prefix.into_key()?;
+        let resolved_key = self.store.resolve(prefix.as_ref());
+        self.store.inner.list(&resolved_key).await
     }
 
     /// Deletes a specific object stored at `base` + `key`. Calling this method with a
     /// key that does not exist in the store is considered a successful delete operation.
     /// This behavior matches the semantics of the HTTP DELETE method.
     /// `None` means the claimed key itself.
-    pub async fn delete(&mut self, key: impl Into<Option<&Key>>) -> Result<(), Error> {
-        let key = key.into();
-        self.store.inner.delete(&self.store.resolve(key)).await
+    pub async fn delete(&mut self, key: impl AsKeyRef) -> Result<(), Error> {
+        let key = key.into_key()?;
+        let resolved_key = self.store.resolve(key.as_ref());
+        self.store.inner.delete(&resolved_key).await
     }
 
     /// Opens a specific object at `base` + `key` for reading. The resulting reader is valid
@@ -265,10 +297,11 @@ impl Claim {
     /// an error. `None` means the claimed key itself.
     pub async fn open_read<'a>(
         &'a mut self,
-        key: impl Into<Option<&Key>>,
+        key: impl AsKeyRef,
     ) -> Result<ObjectReader<'a>, Error> {
-        let key = key.into();
-        self.store.inner.open_read(&self.store.resolve(key)).await
+        let key = key.into_key()?;
+        let resolved_key = self.store.resolve(key.as_ref());
+        self.store.inner.open_read(&resolved_key).await
     }
 
     /// Opens a specific object at `base` + `key` for writing. The specific beahviors around when
@@ -281,10 +314,11 @@ impl Claim {
     /// `None` means the claimed key itself.
     pub async fn open_write<'a>(
         &'a mut self,
-        key: impl Into<Option<&Key>>,
+        key: impl AsKeyRef,
     ) -> Result<ObjectWriter<'a>, Error> {
-        let key = key.into();
-        self.store.inner.open_write(&self.store.resolve(key)).await
+        let key = key.into_key()?;
+        let resolved_key = self.store.resolve(key.as_ref());
+        self.store.inner.open_write(&resolved_key).await
     }
 
     /// Releases the underyling Claim lock issued when the Claim was created. This method exposes
@@ -568,10 +602,9 @@ mod tests {
         async fn example_usage() {
             let v = Vault::new(MemStore, MemClaimer);
             let k = Key::new("foo").unwrap();
-            let mut c = v.claim(k).await.unwrap();
 
-            let k2 = Key::new("bar").unwrap();
-            let mut reader = c.open_read(&k2).await.unwrap();
+            let mut c = v.claim(k).await.unwrap();
+            let mut reader = c.open_read("bar").await.unwrap();
 
             let mut buf: Vec<u8> = Vec::new();
             match reader.read_to_end(&mut buf).await {
@@ -579,7 +612,18 @@ mod tests {
                 Ok(_size) => { /* do something with buf */ }
             }
 
+            // Only one open handle per claim, so drop the reader before opening another.
             drop(reader);
+
+            // The same key as a `&Key`.
+            let k2 = Key::new("bar").unwrap();
+            let reader = c.open_read(&k2).await.unwrap();
+            drop(reader);
+
+            // `None` is the claimed key itself, here `foo`.
+            let reader = c.open_read(None).await.unwrap();
+            drop(reader);
+
             drop(c);
         }
     }

@@ -59,8 +59,9 @@ Rust code. Security enforcement lives in key validation (§3) and in each backen
    with a held claim. It never sees the store.
 4. On success the vault stores the lock in the claim (`set_lock`) and returns it. On an error,
    or if the `claim()` future is dropped, the lock-less claim is dropped and gives its count back.
-5. The claim's operations take an `Option<&Key>` **relative to the claimed key**: `None` is the
-   claimed key itself, `Some(k)` a key beneath it. They can't leave the claim's subtree (D48).
+5. The claim's operations take a key **relative to the claimed key** as `impl AsKeyRef`: a
+   `&str`, a `&Key`, or `None` for the claimed key itself. They can't leave the claim's
+   subtree (D48).
 6. `claim.release()` releases the lock and returns any error; dropping the claim releases it if
    that hasn't happened (errors are logged) and decrements the outstanding count, so `shutdown`
    can finish.
@@ -105,11 +106,16 @@ A claim on `k` can touch `k` and its descendants and nothing else. `Claim::new` 
 vault's store in `ScopedStore::new(k, store)`: every key the claim receives is joined beneath
 `k`, and since keys can't contain `..` and `join` only nests, there's no way out.
 
-Claim operations take `Option<&Key>` (D48). `Claim` holds the `ScopedStore` and resolves the
-argument with `ScopedStore::resolve`: `None` → `k`, `Some(x)` → `k.join(x)`. It then calls the
-inner `Store` with that full key, so backends never see an optional or empty key. So
-`claim.delete(None)` deletes the claimed object itself, and `claim.list(None)` lists everything
-in the claim.
+Claim operations take `key: impl AsKeyRef` (D48). The `AsKeyRef` trait is implemented for
+`&str`, `&Key` and `Option<&Key>`, so callers can write `claim.open_read("notes.md")`,
+`claim.open_read(&key)` or `claim.open_read(None)`. A `&str` is validated with `Key::new` when
+the method is called, and an invalid one returns `Error::Key`. There's no impl for an owned
+`Key` (pass `&key`), and only one `Option` impl, so a bare `None` is unambiguous.
+
+`Claim` holds the `ScopedStore` and resolves the argument with `ScopedStore::resolve`: `None` →
+`k`, `Some(x)` → `k.join(x)`. It then calls the inner `Store` with that full key, so backends
+never see an optional or empty key. So `claim.delete(None)` deletes the claimed object itself,
+and `claim.list(None)` lists everything in the claim.
 
 ### 4.2 Ownership and threads (D37)
 - `Claim` is `Send`: it can be moved to another thread or into a spawned task. This is
@@ -127,8 +133,8 @@ in the claim.
 pub type ObjectReader<'a> = Pin<Box<dyn AsyncRead + Send + 'a>>;
 pub type ObjectWriter<'a> = Pin<Box<dyn AsyncWrite + Send + 'a>>;
 
-pub async fn open_read<'a>(&'a mut self, key: Option<&Key>) -> Result<ObjectReader<'a>, Error>;
-pub async fn open_write<'a>(&'a mut self, key: Option<&Key>) -> Result<ObjectWriter<'a>, Error>;
+pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<ObjectReader<'a>, Error>;
+pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<ObjectWriter<'a>, Error>;
 ```
 - **Pinned and boxed** so the `futures` extension methods (`read_to_end`, `write_all`, …) work
   whether or not a backend's reader is `Unpin`; **`Send`** so tasks holding one stay spawnable.
@@ -306,13 +312,16 @@ impl Vault {
     pub async fn shutdown(self);
 }
 
+pub trait AsKeyRef { fn into_key(self) -> Result<Option<Key>, KeyError>; }
+// implemented for &str (validated), &Key, Option<&Key>
+
 pub struct Claim { store: ScopedStore, lock: Option<Box<dyn ClaimLock>>, state: Arc<Mutex<VaultState>> }
 impl Claim {                                              // Send, never Clone
-    // `None` = the claimed key itself (D48)
-    pub async fn list(&mut self, prefix: Option<&Key>) -> Result<Vec<Key>, Error>;
-    pub async fn delete(&mut self, key: Option<&Key>) -> Result<(), Error>;
-    pub async fn open_read<'a>(&'a mut self, key: Option<&Key>) -> Result<ObjectReader<'a>, Error>;
-    pub async fn open_write<'a>(&'a mut self, key: Option<&Key>) -> Result<ObjectWriter<'a>, Error>;
+    // key: "a/b", &key, or None (= the claimed key itself) (D48)
+    pub async fn list(&mut self, prefix: impl AsKeyRef) -> Result<Vec<Key>, Error>;
+    pub async fn delete(&mut self, key: impl AsKeyRef) -> Result<(), Error>;
+    pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<ObjectReader<'a>, Error>;
+    pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<ObjectWriter<'a>, Error>;
     pub fn release(&mut self) -> Result<(), Error>;
 }
 impl Drop for Claim { /* self.release() (errors logged), then count down */ }
