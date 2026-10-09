@@ -77,3 +77,112 @@ impl Vault {
         .await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ClaimLock, ObjectReader, ObjectWriter};
+    use futures::FutureExt;
+    use futures::future::{self, BoxFuture};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A store the claim never uses in these tests.
+    struct NullStore;
+
+    impl Store for NullStore {
+        fn list(&self, _: &Key) -> BoxFuture<'_, Result<Vec<Key>, Error>> {
+            Box::pin(future::ready(Ok(Vec::new())))
+        }
+        fn delete<'a>(&'a self, _: &Key) -> BoxFuture<'a, Result<(), Error>> {
+            Box::pin(future::ready(Ok(())))
+        }
+        fn open_read<'a>(&'a self, k: &Key) -> BoxFuture<'a, Result<ObjectReader<'a>, Error>> {
+            Box::pin(future::ready(Err(Error::NotFound { key: k.clone() })))
+        }
+        fn open_write<'a>(&'a self, k: &Key) -> BoxFuture<'a, Result<ObjectWriter<'a>, Error>> {
+            Box::pin(future::ready(Err(Error::NotFound { key: k.clone() })))
+        }
+    }
+
+    // Grants every lock; each lock counts its releases and optionally fails them.
+    struct CountingClaimer {
+        releases: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    struct CountingLock {
+        releases: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl ClaimLock for CountingLock {
+        fn release(self: Box<Self>) -> Result<(), Error> {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            match self.fail {
+                true => Err(Error::ClaimError("release failed".into())),
+                false => Ok(()),
+            }
+        }
+    }
+
+    impl Claimer for CountingClaimer {
+        fn try_lock<'a>(&'a self, _: &Key) -> BoxFuture<'a, Result<Box<dyn ClaimLock>, Error>> {
+            let lock = CountingLock {
+                releases: self.releases.clone(),
+                fail: self.fail,
+            };
+            Box::pin(future::ready(Ok(Box::new(lock) as Box<dyn ClaimLock>)))
+        }
+    }
+
+    // Never grants a lock.
+    struct PendingClaimer;
+
+    impl Claimer for PendingClaimer {
+        fn try_lock<'a>(&'a self, _: &Key) -> BoxFuture<'a, Result<Box<dyn ClaimLock>, Error>> {
+            Box::pin(future::pending())
+        }
+    }
+
+    fn counting_vault(fail: bool) -> (Vault, Arc<AtomicUsize>) {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let claimer = CountingClaimer {
+            releases: releases.clone(),
+            fail,
+        };
+        (Vault::new(NullStore, claimer), releases)
+    }
+
+    fn claim(vault: &Vault) -> Claim {
+        let key = Key::new("a").unwrap();
+        vault.claim(key).now_or_never().unwrap().unwrap()
+    }
+
+    #[test]
+    fn lock_is_released_exactly_once() {
+        let (vault, releases) = counting_vault(false);
+        claim(&vault).release().unwrap(); // release, then the implicit drop
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        drop(claim(&vault)); // drop only
+        assert_eq!(releases.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn release_errors_surface_and_still_count_down() {
+        let (vault, releases) = counting_vault(true);
+        assert!(matches!(claim(&vault).release(), Err(Error::ClaimError(_))));
+        drop(claim(&vault)); // the error is only logged
+        assert_eq!(releases.load(Ordering::SeqCst), 2);
+        assert!(vault.shutdown().now_or_never().is_some());
+    }
+
+    #[test]
+    fn cancelled_claim_gives_its_count_back() {
+        // D47: dropping a `claim()` future mid-`try_lock` must not leave a count behind.
+        let vault = Vault::new(NullStore, PendingClaimer);
+        let mut pending = Box::pin(vault.claim(Key::new("a").unwrap()));
+        assert!((&mut pending).now_or_never().is_none());
+        drop(pending);
+        assert!(vault.shutdown().now_or_never().is_some());
+    }
+}

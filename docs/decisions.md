@@ -150,7 +150,7 @@ any runtime, and must not block or panic (`design.md` §4.4).
 
 | Item | Status in `lib-vault/src/` |
 |---|---|
-| Build | ✅ Workspace builds; `lib-vault`'s 27 unit tests pass; clippy and `cargo doc` are clean; the `Claim::list` example is `ignore`d. |
+| Build | ✅ Workspace builds; `lib-vault`'s 19 unit tests pass; clippy and `cargo doc` are clean; the `Claim::list` example is `ignore`d. |
 | D6, D34, D35, D48 `Key` | ✅ Name policy, caps and fallible `join` implemented with unit tests; empty keys rejected. `Store::open_write` documents the case-collision rule. |
 | D36 scoping | ✅ `Claim::new` wraps the store in `ScopedStore`. |
 | D37 thread model | ✅ `&mut self` methods; compile-time `Claim: Send` test. No `Send` assertion for the `claim()`/`shutdown()` futures (they are `Send`, checked with a probe against v8). |

@@ -391,6 +391,10 @@ mod key_tests {
         assert!(Key::new(&deep).is_ok());
         assert_eq!(Key::new(&format!("{deep}/a")), Err(KeyError::TooDeep));
 
+        let max = vec!["a".repeat(204); 5].join("/");
+        assert_eq!(max.len(), MAX_KEY_LEN);
+        assert!(Key::new(&max).is_ok());
+
         let huge = vec!["a".repeat(100); 11].join("/");
         assert!(huge.len() > MAX_KEY_LEN);
         assert_eq!(Key::new(&huge), Err(KeyError::TooLong));
@@ -399,6 +403,11 @@ mod key_tests {
     #[test]
     fn join_enforces_caps() {
         let twenty = key(&vec!["a"; 20].join("/"));
+        let twelve = key(&["a"; 12].join("/"));
+        assert_eq!(
+            twenty.join(&twelve).unwrap().components().count(),
+            MAX_DEPTH
+        );
         assert_eq!(twenty.join(&twenty), Err(KeyError::TooDeep));
 
         let big = key(&vec!["a".repeat(200); 3].join("/"));
@@ -464,179 +473,5 @@ mod key_tests {
         assert_eq!(k.to_string(), "a/b");
         assert_eq!(Key::try_from("a/b").unwrap(), k);
         assert_eq!(k.as_ref(), "a/b");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    mod key_tests {
-        use super::*;
-
-        fn key(s: &str) -> Key {
-            Key::new(s).unwrap()
-        }
-
-        #[test]
-        fn accepts_canonical_keys() {
-            for s in [
-                "a",
-                "a/b",
-                "sessions/123/notes.md",
-                ".hidden",
-                "a/..b",
-                "a b/c",
-            ] {
-                assert_eq!(Key::new(s).unwrap().as_str(), s);
-            }
-        }
-
-        #[test]
-        fn rejects_non_canonical_keys() {
-            let cases = [
-                ("", KeyError::Empty),
-                ("/", KeyError::LeadingSlash),
-                ("/a", KeyError::LeadingSlash),
-                ("a/", KeyError::TrailingSlash),
-                ("a//b", KeyError::EmptyComponent),
-                (".", KeyError::DotComponent),
-                ("..", KeyError::DotComponent),
-                ("a/./b", KeyError::DotComponent),
-                ("a/../b", KeyError::DotComponent),
-                ("a/..", KeyError::DotComponent),
-                ("a\0b", KeyError::Nul),
-            ];
-            for (s, err) in cases {
-                assert_eq!(Key::new(s), Err(err), "{s:?}");
-                assert_eq!(Key::try_from(s.to_string()), Err(err), "{s:?}");
-            }
-        }
-
-        #[test]
-        fn rejects_names_outside_the_policy() {
-            let cases = [
-                ("a/b*c", KeyError::InvalidChar),
-                ("caf\u{e9}", KeyError::InvalidChar),
-                ("a\tb", KeyError::InvalidChar),
-                ("-a", KeyError::BadComponentStart),
-                ("x/ a", KeyError::BadComponentStart),
-                ("a.", KeyError::BadComponentEnd),
-                ("x/a ", KeyError::BadComponentEnd),
-                ("CON", KeyError::Reserved),
-                ("x/con.txt", KeyError::Reserved),
-                ("Nul.tar.gz", KeyError::Reserved),
-                ("lpt1", KeyError::Reserved),
-                ("COM9.log", KeyError::Reserved),
-                (".vault", KeyError::Reserved),
-                ("x/.VAULTdata", KeyError::Reserved),
-            ];
-            for (s, err) in cases {
-                assert_eq!(Key::new(s), Err(err), "{s:?}");
-            }
-        }
-
-        #[test]
-        fn accepts_names_near_reserved_ones() {
-            for s in [
-                "console",
-                "com",
-                "com10",
-                "lpt",
-                "auxiliary",
-                "x.vault",
-                "a-b_c.d e",
-            ] {
-                assert!(Key::new(s).is_ok(), "{s:?}");
-            }
-        }
-
-        #[test]
-        fn enforces_caps() {
-            let long = "a".repeat(MAX_COMPONENT_LEN);
-            assert!(Key::new(&long).is_ok());
-            assert_eq!(
-                Key::new(&format!("{long}a")),
-                Err(KeyError::ComponentTooLong)
-            );
-
-            let deep = vec!["a"; MAX_DEPTH].join("/");
-            assert!(Key::new(&deep).is_ok());
-            assert_eq!(Key::new(&format!("{deep}/a")), Err(KeyError::TooDeep));
-
-            let huge = vec!["a".repeat(100); 11].join("/");
-            assert!(huge.len() > MAX_KEY_LEN);
-            assert_eq!(Key::new(&huge), Err(KeyError::TooLong));
-        }
-
-        #[test]
-        fn join_enforces_caps() {
-            let twenty = key(&vec!["a"; 20].join("/"));
-            assert_eq!(twenty.join(&twenty), Err(KeyError::TooDeep));
-
-            let big = key(&vec!["a".repeat(200); 3].join("/"));
-            assert_eq!(big.join(&big), Err(KeyError::TooLong));
-        }
-
-        #[test]
-        fn join() {
-            assert_eq!(key("a").join(&key("b/c")).unwrap(), key("a/b/c"));
-            assert_eq!(key("a/b").join(&key("c")).unwrap(), key("a/b/c"));
-
-            let (a, b, c) = (key("a"), key("b/x"), key("c"));
-            assert_eq!(
-                a.join(&b).unwrap().join(&c).unwrap(),
-                a.join(&b.join(&c).unwrap()).unwrap()
-            );
-        }
-
-        #[test]
-        fn join_always_nests() {
-            let base = key("scope");
-            for other in ["a", "a/b", "scope", "x/scope"] {
-                assert!(
-                    base.join(&key(other)).unwrap().starts_with(&base),
-                    "{other:?}"
-                );
-            }
-        }
-
-        #[test]
-        fn components() {
-            let k = key("a/b/c");
-            let parts: Vec<_> = k.components().collect();
-            assert_eq!(parts, ["a", "b", "c"]);
-        }
-
-        #[test]
-        fn starts_with_compares_components() {
-            assert!(key("a/b/c").starts_with(&key("a/b")));
-            assert!(key("a/b").starts_with(&key("a/b")));
-            assert!(!key("a/bc").starts_with(&key("a/b")));
-            assert!(!key("a").starts_with(&key("a/b")));
-        }
-
-        #[test]
-        fn strip_prefix() {
-            assert_eq!(key("a/b/c").strip_prefix(&key("a")), Some(key("b/c")));
-            assert_eq!(key("a/b").strip_prefix(&key("a/b")), None);
-            assert_eq!(key("a/bc").strip_prefix(&key("a/b")), None);
-        }
-
-        #[test]
-        fn parent_and_object_name() {
-            assert_eq!(key("a/b/c").parent(), Some(key("a/b")));
-            assert_eq!(key("a").parent(), None);
-            assert_eq!(key("a/b/c").object_name(), Some("c"));
-            assert_eq!(key("a").object_name(), Some("a"));
-        }
-
-        #[test]
-        fn parse_and_display_round_trip() {
-            let k: Key = "a/b".parse().unwrap();
-            assert_eq!(k.to_string(), "a/b");
-            assert_eq!(Key::try_from("a/b").unwrap(), k);
-            assert_eq!(k.as_ref(), "a/b");
-        }
     }
 }

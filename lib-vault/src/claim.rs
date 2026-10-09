@@ -147,6 +147,18 @@ mod tests {
                 const fn assert_send<T: Send>() {}
                 assert_send::<Claim>()
             };
+
+            // `Vault` is shared across threads, and its futures must stay spawnable on
+            // multi-threaded runtimes (design §13).
+            fn assert_vault<T: Send + Sync + Clone>() {}
+            assert_vault::<crate::Vault>();
+
+            fn assert_send_value<T: Send>(_: &T) {}
+            fn futures_are_send(vault: crate::Vault) {
+                assert_send_value(&vault.claim(crate::Key::new("a").unwrap()));
+                assert_send_value(&vault.shutdown());
+            }
+            let _ = futures_are_send;
         }
     }
 }

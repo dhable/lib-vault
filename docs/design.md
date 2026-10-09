@@ -363,7 +363,7 @@ trait using `async fn` can't be used as `dyn Trait` and can't promise its future
 An `async fn`'s `Send`-ness is inferred, so it can be lost silently (as the v6 `claim`, which
 held a `MutexGuard` across `.await`, showed); §13 asserts it.
 
-**Build status:** the workspace builds; `lib-vault`'s 27 unit tests pass, including a
+**Build status:** the workspace builds; `lib-vault`'s 19 unit tests pass, including a
 compile-time `Claim: Send` check; clippy and `cargo doc` are clean; the `Claim::list` example
 is `ignore`d. Known leftovers:
 - a stale `REVIEW(nit)` comment above the `try_lock` docs (what it flags is fixed);

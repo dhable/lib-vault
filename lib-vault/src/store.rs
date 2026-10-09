@@ -82,3 +82,64 @@ impl Store for ScopedStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt;
+    use std::sync::Mutex;
+
+    // Records the keys it's called with; never stores anything.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<String>>);
+
+    impl Recorder {
+        fn record<'a, T: Send + 'a>(&'a self, key: &Key, out: T) -> BoxFuture<'a, T> {
+            self.0.lock().unwrap().push(key.as_str().to_owned());
+            Box::pin(futures::future::ready(out))
+        }
+    }
+
+    impl Store for Recorder {
+        fn list(&self, key: &Key) -> BoxFuture<'_, Result<Vec<Key>, Error>> {
+            self.record(key, Ok(Vec::new()))
+        }
+        fn delete<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<(), Error>> {
+            self.record(key, Ok(()))
+        }
+        fn open_read<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<ObjectReader<'a>, Error>> {
+            let k = key.clone();
+            self.record(key, Err(Error::NotFound { key: k }))
+        }
+        fn open_write<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<ObjectWriter<'a>, Error>> {
+            let k = key.clone();
+            self.record(key, Err(Error::NotFound { key: k }))
+        }
+    }
+
+    fn scoped(base: &str) -> (ScopedStore, Arc<Recorder>) {
+        let recorder = Arc::new(Recorder::default());
+        let store = ScopedStore::new(Key::new(base).unwrap(), recorder.clone());
+        (store, recorder)
+    }
+
+    #[test]
+    fn scoped_store_prefixes_every_call() {
+        let (store, recorder) = scoped("base");
+        let k = Key::new("x/y").unwrap();
+        let _ = store.list(&k).now_or_never().unwrap();
+        let _ = store.delete(&k).now_or_never().unwrap();
+        let _ = store.open_read(&k).now_or_never().unwrap();
+        let _ = store.open_write(&k).now_or_never().unwrap();
+        assert_eq!(*recorder.0.lock().unwrap(), ["base/x/y"; 4]);
+    }
+
+    #[test]
+    fn scoped_store_rejects_keys_past_the_caps() {
+        let (store, recorder) = scoped("base");
+        let deep = Key::new(&vec!["a"; crate::MAX_DEPTH].join("/")).unwrap();
+        let result = store.delete(&deep).now_or_never().unwrap();
+        assert!(matches!(result, Err(Error::Key(KeyError::TooDeep))));
+        assert!(recorder.0.lock().unwrap().is_empty());
+    }
+}
