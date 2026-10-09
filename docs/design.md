@@ -80,13 +80,26 @@ things a vault must not (absolute paths, `..`, OS-specific syntax).
   - no leading or trailing `/`, no empty components (`a//b`);
   - no `.` or `..` components;
   - no NUL bytes.
-  Anything else is rejected with a `KeyError` (`Empty`, `LeadingSlash`, `TrailingSlash`,
-  `EmptyComponent`, `DotComponent`, `Nul`). Nothing is normalized.
+- **Name policy** (D6, enforced by `Key::validate` for every backend): each component
+  - uses only `[A-Za-z0-9._ -]`;
+  - doesn't start with `-` or a space, or end with `.` or a space;
+  - isn't a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`,
+    with or without an extension, in any case) and doesn't start with `.vault` (reserved, any
+    case);
+  - is at most `MAX_COMPONENT_LEN` = 255 bytes.
+
+  A whole key has at most `MAX_DEPTH` = 32 components and `MAX_KEY_LEN` = 1024 bytes.
+- **Errors**: anything else is rejected with a `KeyError`: `Empty`, `LeadingSlash`,
+  `TrailingSlash`, `EmptyComponent`, `DotComponent`, `Nul`, `InvalidChar`, `BadComponentStart`,
+  `BadComponentEnd`, `Reserved`, `ComponentTooLong`, `TooDeep`, `TooLong`. Nothing is
+  normalized.
 - **Representation**: `Key(Arc<str>)`. Cloning is a refcount bump, so a `Store` can clone a
   `&Key` into a `'static` future rather than borrowing it.
-- **`join(&self, &Key) -> Key`** (D35): infallible, because both sides are already canonical.
-  Unlike `Path::join`, the argument never replaces the base: `a` joined with `b/c` is always
-  `a/b/c`, beneath `self`.
+- **`join(&self, &Key) -> Result<Key, KeyError>`** (D35): unlike `Path::join`, the argument
+  never replaces the base: `a` joined with `b/c` is always `a/b/c`, beneath `self`. Both sides
+  are already valid, so the only possible errors are `TooDeep` and `TooLong`, when the joined
+  key exceeds the caps. That keeps every `Key`, including a claim's resolved full keys, within
+  the policy.
 - **Component-wise helpers**: `components`, `starts_with` (`a/bc` does *not* start with `a/b`;
   a key starts with itself), `strip_prefix` (`a/b/c` minus `a` is `b/c`; a key minus itself is
   `None`), `parent` (`None` for a single-component key), `object_name` (the last component;
@@ -96,8 +109,8 @@ things a vault must not (absolute paths, `..`, OS-specific syntax).
   `From<&Key>` (a cheap clone), `AsRef<str>`, `Display`. There is no `Key::root`.
 - **Naming the claim itself** (D48): since there's no empty key, the whole vault can't be
   claimed, and a claim refers to its own key with `None` (§4.1).
-- The portable name policy (§10) is enforced by the filesystem backend today. Moving it into
-  `Key` for every backend is open (P38).
+- **Case collisions** can't be checked by `Key` (they depend on what's stored), so they're a
+  `Store` contract rule for every backend: creating `Foo` fails when `foo` exists (§5, D6).
 
 ## 4. Claims
 
@@ -113,7 +126,8 @@ the method is called, and an invalid one returns `Error::Key`. There's no impl f
 `Key` (pass `&key`), and only one `Option` impl, so a bare `None` is unambiguous.
 
 `Claim` holds the `ScopedStore` and resolves the argument with `ScopedStore::resolve`: `None` →
-`k`, `Some(x)` → `k.join(x)`. It then calls the inner `Store` with that full key, so backends
+`k`, `Some(x)` → `k.join(x)`, which can fail with `Error::Key` if the full key would exceed the
+depth or length cap. It then calls the inner `Store` with that full key, so backends
 never see an optional or empty key. So `claim.delete(None)` deletes the claimed object itself,
 and `claim.list(None)` lists everything in the claim.
 
@@ -232,8 +246,12 @@ pub trait Store: Send + Sync + 'static {
     fn open_write<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<ObjectWriter<'a>, Error>>;
 }
 ```
-Every key a `Store` receives is a full, non-empty key; `Claim` resolves its optional,
-claim-relative keys before calling the store (D48).
+Every key a `Store` receives is a full key that already satisfies the name policy and caps
+(§3); `Claim` resolves its optional, claim-relative keys before calling the store (D48).
+
+**Case collisions** (D6): `open_write` must fail if the key differs only by ASCII case from an
+existing object's key, so `Foo` and `foo` never coexist. This is the one name rule that needs
+stored state, so every backend enforces it rather than `Key`. Doing it race-free is P20.
 
 Object semantics (D43):
 - **`list`** (D40): everything beneath `key`, as keys relative to `key`; "beneath" is
@@ -298,13 +316,16 @@ pub enum Error {                                          // D12
 pub struct Key(Arc<str>);                                 // §3
 impl Key {
     pub fn new(s: &str) -> Result<Key, KeyError>;
-    pub fn join(&self, other: &Key) -> Key;
+    pub fn join(&self, other: &Key) -> Result<Key, KeyError>;   // TooDeep / TooLong
     pub fn starts_with(&self, base: &Key) -> bool;
     pub fn strip_prefix(&self, base: &Key) -> Option<Key>;
     pub fn parent(&self) -> Option<Key>;
     pub fn object_name(&self) -> Option<&str>;
     pub fn components(&self) -> impl DoubleEndedIterator<Item = &str>;
 }
+pub const MAX_COMPONENT_LEN: usize = 255;
+pub const MAX_DEPTH: usize = 32;
+pub const MAX_KEY_LEN: usize = 1024;
 
 pub type ObjectReader<'a> = Pin<Box<dyn AsyncRead + Send + 'a>>;
 pub type ObjectWriter<'a> = Pin<Box<dyn AsyncWrite + Send + 'a>>;
@@ -368,7 +389,7 @@ TOCTOU window, because an external process can swap a component for a symlink be
 Instead:
 
 1. The store opens the root directory once and keeps the handle. Every later operation is relative to a held handle, so renaming or replacing the root path afterwards has no effect.
-2. Keys are already free of `..`/`.`/empty/NUL/absolute components (§3). The backend adds the name policy (§10).
+2. Keys already satisfy the syntax rules, the name policy and the caps (§3). The backend adds only the case-collision check (§5).
 3. Resolution:
    - **Linux ≥ 5.6**: `openat2(dirfd, p, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`. On older kernels, fall back to per-component `openat(…, O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)`.
    - **macOS**: per-component `openat(…, O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)`. Leaf opens add `O_NOFOLLOW_ANY` (macOS 11+, P25). There is no `RESOLVE_NO_XDEV` equivalent, so mount crossings are detected by comparing `st_dev` after each step.
@@ -468,14 +489,12 @@ Deployment guide (documentation):
 
 ## 10. AI-harness concerns
 
-- **Name policy (strict portable ASCII, D6)**, enforced by the fs backend on top of `Key` (P38):
-  - components match `[A-Za-z0-9._ -]+`;
-  - no leading `-` or space, no trailing `.` or space;
-  - no Windows reserved names (`CON`, `PRN`, `AUX`, `NUL`, `COM0-9`, `LPT0-9`, with any extension);
-  - component ≤ 255 bytes; key depth and length are capped;
-  - the `.vault` prefix is reserved;
-  - **case-collision check** on create: creating `Foo` is refused when `foo` exists (P20).
-  This rules out terminal-escape, bidi and homoglyph spoofing when names are shown to humans.
+- **Name policy (strict portable ASCII, D6)** for every key and every backend, enforced by
+  `Key::validate` (§3): `[A-Za-z0-9._ -]` only, no leading `-`/space or trailing `.`/space, no
+  Windows device names, no `.vault` prefix, component ≤ 255 bytes, ≤ 32 components, ≤ 1024
+  bytes. The case-collision rule is a `Store` requirement (§5, race: P20). This rules out
+  terminal-escape, bidi and homoglyph spoofing when names are shown to humans, and the same key
+  is valid in every backend.
 - **Claim DoS by the model**: no acquisition timeouts in the library (D23). The harness wraps
   `claim()` in a timeout and owns hold-time and claim-count policy.
 - **Memory poisoning / persistent prompt injection**: the library can't judge content. Future work: optional provenance and tamper detection (P11).
@@ -512,14 +531,16 @@ Async is the base API (D33), not a later addition. Notes carried over from the o
 | `claim.rs` | `Claim`, release / `Drop` |
 | `store.rs` | `Store`, `ScopedStore`, `ObjectReader` / `ObjectWriter` |
 | `claimer.rs` | `Claimer`, `ClaimLock` |
-| `backend/fs/` | `FsStore`, `FlockClaimer`, name policy, inode-lock v1, registry, `sys/{linux,macos}.rs` |
+| `backend/fs/` | `FsStore`, `FlockClaimer`, case-collision check, inode-lock v1, registry, `sys/{linux,macos}.rs` |
 | `backend/memory.rs` *(likely)* | in-memory `Store` + `Claimer` + `ClaimLock`, also useful as the test double |
 | `benches/` *(future)* | fs performance harness (D28, P26) |
 
 ## 13. Verification strategy
 
 - **`Key`** (done, unit tests in `src/lib.rs`): canonical keys accepted, each rejection case,
-  the empty key rejected, join associativity, join always nests, component-wise
+  the empty key rejected, each name-policy rule (characters, leading/trailing characters,
+  reserved names in any case, `.vault`), the caps at and just over their limits, `join`
+  failing with `TooDeep`/`TooLong`, join associativity, join always nests, component-wise
   `starts_with`/`strip_prefix`, `parent`/`object_name`, parse/display round trip.
 - **Compile-time checks**: `Claim: Send` (done), `Vault: Send + Sync + Clone`, and that the futures
   of `Vault::claim`, `Vault::shutdown` and a typical claim-using `async` block that holds a

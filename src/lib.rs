@@ -38,10 +38,27 @@ pub enum Error {
 /// - no `.` or `..` components, so a key can never name something outside its scope;
 /// - no NUL bytes.
 ///
+/// Every component also follows a portable name policy, the same for every `Store`:
+/// - only ASCII letters, digits, `.`, `_`, ` ` and `-`;
+/// - no leading `-` or space, no trailing `.` or space;
+/// - not a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9`, `LPT0`-`LPT9`,
+///   with or without an extension, in any case) and not starting with `.vault` (reserved);
+/// - at most [`MAX_COMPONENT_LEN`] bytes.
+///
+/// A key has at most [`MAX_DEPTH`] components and [`MAX_KEY_LEN`] bytes. Stores also refuse to
+/// create a key that differs only by ASCII case from an existing one (see `Store::open_write`).
+///
 /// Cloning is cheap (an `Arc<str>` refcount bump), so implementations can clone a `&Key`
 /// into a `'static` future instead of borrowing it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key(Arc<str>);
+
+/// The longest allowed key component, in bytes.
+pub const MAX_COMPONENT_LEN: usize = 255;
+/// The most components a key may have.
+pub const MAX_DEPTH: usize = 32;
+/// The longest allowed key, in bytes.
+pub const MAX_KEY_LEN: usize = 1024;
 
 /// Why a string was rejected by `Key::new`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +75,20 @@ pub enum KeyError {
     DotComponent,
     /// Contains a NUL byte.
     Nul,
+    /// Contains a character other than ASCII letters, digits, `.`, `_`, ` ` and `-`.
+    InvalidChar,
+    /// A component starts with `-` or a space.
+    BadComponentStart,
+    /// A component ends with `.` or a space.
+    BadComponentEnd,
+    /// A component is a Windows device name or starts with `.vault`.
+    Reserved,
+    /// A component is longer than `MAX_COMPONENT_LEN` bytes.
+    ComponentTooLong,
+    /// More than `MAX_DEPTH` components.
+    TooDeep,
+    /// Longer than `MAX_KEY_LEN` bytes.
+    TooLong,
 }
 
 impl fmt::Display for KeyError {
@@ -69,6 +100,15 @@ impl fmt::Display for KeyError {
             KeyError::EmptyComponent => "key must not contain empty components ('//')",
             KeyError::DotComponent => "key must not contain '.' or '..' components",
             KeyError::Nul => "key must not contain NUL bytes",
+            KeyError::InvalidChar => {
+                "key may only contain ASCII letters, digits, '.', '_', ' ' and '-'"
+            }
+            KeyError::BadComponentStart => "key components must not start with '-' or a space",
+            KeyError::BadComponentEnd => "key components must not end with '.' or a space",
+            KeyError::Reserved => "key contains a reserved name",
+            KeyError::ComponentTooLong => "key component is too long",
+            KeyError::TooDeep => "key has too many components",
+            KeyError::TooLong => "key is too long",
         };
         f.write_str(msg)
     }
@@ -96,9 +136,12 @@ impl Key {
     ///
     /// Unlike `Path::join`, `other` can never replace `self`: keys are always relative, so
     /// the result is always `self` or something beneath it. `ScopedStore` relies on this to
-    /// keep callers inside their scope.
-    pub fn join(&self, other: &Key) -> Key {
-        Key(Arc::from(format!("{}/{}", self.0, other.0)))
+    /// keep callers inside their scope. Fails only if the result would exceed `MAX_DEPTH` or
+    /// `MAX_KEY_LEN`.
+    pub fn join(&self, other: &Key) -> Result<Key, KeyError> {
+        let joined = format!("{}/{}", self.0, other.0);
+        Self::check_caps(&joined)?;
+        Ok(Key(Arc::from(joined)))
     }
 
     /// True if `base` is `self` or one of its ancestors. Compares whole components, so
@@ -138,6 +181,9 @@ impl Key {
         if s.is_empty() {
             return Err(KeyError::Empty);
         }
+        if s.len() > MAX_KEY_LEN {
+            return Err(KeyError::TooLong);
+        }
         if s.contains('\0') {
             return Err(KeyError::Nul);
         }
@@ -148,11 +194,63 @@ impl Key {
             return Err(KeyError::TrailingSlash);
         }
         for component in s.split('/') {
-            match component {
-                "" => return Err(KeyError::EmptyComponent),
-                "." | ".." => return Err(KeyError::DotComponent),
-                _ => {}
+            Self::validate_component(component)?;
+        }
+        Self::check_caps(s)
+    }
+
+    fn validate_component(c: &str) -> Result<(), KeyError> {
+        match c {
+            "" => return Err(KeyError::EmptyComponent),
+            "." | ".." => return Err(KeyError::DotComponent),
+            _ => {}
+        }
+        if c.len() > MAX_COMPONENT_LEN {
+            return Err(KeyError::ComponentTooLong);
+        }
+        if !c
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b' ' | b'-'))
+        {
+            return Err(KeyError::InvalidChar);
+        }
+        if c.starts_with(['-', ' ']) {
+            return Err(KeyError::BadComponentStart);
+        }
+        if c.ends_with(['.', ' ']) {
+            return Err(KeyError::BadComponentEnd);
+        }
+        if Self::is_reserved(c) {
+            return Err(KeyError::Reserved);
+        }
+        Ok(())
+    }
+
+    // Windows device names (with any extension) and the `.vault` prefix, ignoring ASCII case.
+    fn is_reserved(c: &str) -> bool {
+        let lower = c.to_ascii_lowercase();
+        if lower.starts_with(".vault") {
+            return true;
+        }
+        let stem = lower.split('.').next().unwrap_or("");
+        match stem {
+            "con" | "prn" | "aux" | "nul" => true,
+            _ => {
+                let (prefix, digit) = stem.split_at(stem.len().min(3));
+                matches!(prefix, "com" | "lpt")
+                    && digit.len() == 1
+                    && digit.as_bytes()[0].is_ascii_digit()
             }
+        }
+    }
+
+    // The whole-key caps, shared with `join`.
+    fn check_caps(s: &str) -> Result<(), KeyError> {
+        if s.len() > MAX_KEY_LEN {
+            return Err(KeyError::TooLong);
+        }
+        if s.split('/').count() > MAX_DEPTH {
+            return Err(KeyError::TooDeep);
         }
         Ok(())
     }
@@ -278,7 +376,7 @@ impl Claim {
     /// `None` lists everything in the claim.
     pub async fn list(&mut self, prefix: impl AsKeyRef) -> Result<Vec<Key>, Error> {
         let prefix = prefix.into_key()?;
-        let resolved_key = self.store.resolve(prefix.as_ref());
+        let resolved_key = self.store.resolve(prefix.as_ref())?;
         self.store.inner.list(&resolved_key).await
     }
 
@@ -288,7 +386,7 @@ impl Claim {
     /// `None` means the claimed key itself.
     pub async fn delete(&mut self, key: impl AsKeyRef) -> Result<(), Error> {
         let key = key.into_key()?;
-        let resolved_key = self.store.resolve(key.as_ref());
+        let resolved_key = self.store.resolve(key.as_ref())?;
         self.store.inner.delete(&resolved_key).await
     }
 
@@ -300,7 +398,7 @@ impl Claim {
         key: impl AsKeyRef,
     ) -> Result<ObjectReader<'a>, Error> {
         let key = key.into_key()?;
-        let resolved_key = self.store.resolve(key.as_ref());
+        let resolved_key = self.store.resolve(key.as_ref())?;
         self.store.inner.open_read(&resolved_key).await
     }
 
@@ -317,7 +415,7 @@ impl Claim {
         key: impl AsKeyRef,
     ) -> Result<ObjectWriter<'a>, Error> {
         let key = key.into_key()?;
-        let resolved_key = self.store.resolve(key.as_ref());
+        let resolved_key = self.store.resolve(key.as_ref())?;
         self.store.inner.open_write(&resolved_key).await
     }
 
@@ -448,7 +546,8 @@ pub trait Store: Send + Sync + 'static {
     fn open_read<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<ObjectReader<'a>, Error>>;
 
     /// Opens the object at `key` for writing, creating or overwriting it. Implementations
-    /// document when written data is committed (e.g. on `close()`).
+    /// document when written data is committed (e.g. on `close()`). Must fail if `key` differs
+    /// only by ASCII case from an existing object's key, so `Foo` and `foo` never coexist.
     fn open_write<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<ObjectWriter<'a>, Error>>;
 }
 
@@ -466,26 +565,38 @@ impl ScopedStore {
     }
 
     // The full key for an optional key relative to `base`; `None` is `base` itself.
-    fn resolve(&self, key: Option<&Key>) -> Key {
-        key.map_or_else(|| self.base.clone(), |k| self.base.join(k))
+    fn resolve(&self, key: Option<&Key>) -> Result<Key, KeyError> {
+        key.map_or_else(|| Ok(self.base.clone()), |k| self.base.join(k))
     }
 }
 
 impl Store for ScopedStore {
     fn delete<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<(), Error>> {
-        self.inner.delete(&self.base.join(key))
+        match self.base.join(key) {
+            Ok(key) => self.inner.delete(&key),
+            Err(e) => Box::pin(futures::future::ready(Err(e.into()))),
+        }
     }
 
     fn list(&self, key: &Key) -> BoxFuture<'_, Result<Vec<Key>, Error>> {
-        self.inner.list(&self.base.join(key))
+        match self.base.join(key) {
+            Ok(key) => self.inner.list(&key),
+            Err(e) => Box::pin(futures::future::ready(Err(e.into()))),
+        }
     }
 
     fn open_read<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<ObjectReader<'a>, Error>> {
-        self.inner.open_read(&self.base.join(key))
+        match self.base.join(key) {
+            Ok(key) => self.inner.open_read(&key),
+            Err(e) => Box::pin(futures::future::ready(Err(e.into()))),
+        }
     }
 
     fn open_write<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<ObjectWriter<'a>, Error>> {
-        self.inner.open_write(&self.base.join(key))
+        match self.base.join(key) {
+            Ok(key) => self.inner.open_write(&key),
+            Err(e) => Box::pin(futures::future::ready(Err(e.into()))),
+        }
     }
 }
 
@@ -693,19 +804,90 @@ mod tests {
         }
 
         #[test]
+        fn rejects_names_outside_the_policy() {
+            let cases = [
+                ("a/b*c", KeyError::InvalidChar),
+                ("caf\u{e9}", KeyError::InvalidChar),
+                ("a\tb", KeyError::InvalidChar),
+                ("-a", KeyError::BadComponentStart),
+                ("x/ a", KeyError::BadComponentStart),
+                ("a.", KeyError::BadComponentEnd),
+                ("x/a ", KeyError::BadComponentEnd),
+                ("CON", KeyError::Reserved),
+                ("x/con.txt", KeyError::Reserved),
+                ("Nul.tar.gz", KeyError::Reserved),
+                ("lpt1", KeyError::Reserved),
+                ("COM9.log", KeyError::Reserved),
+                (".vault", KeyError::Reserved),
+                ("x/.VAULTdata", KeyError::Reserved),
+            ];
+            for (s, err) in cases {
+                assert_eq!(Key::new(s), Err(err), "{s:?}");
+            }
+        }
+
+        #[test]
+        fn accepts_names_near_reserved_ones() {
+            for s in [
+                "console",
+                "com",
+                "com10",
+                "lpt",
+                "auxiliary",
+                "x.vault",
+                "a-b_c.d e",
+            ] {
+                assert!(Key::new(s).is_ok(), "{s:?}");
+            }
+        }
+
+        #[test]
+        fn enforces_caps() {
+            let long = "a".repeat(MAX_COMPONENT_LEN);
+            assert!(Key::new(&long).is_ok());
+            assert_eq!(
+                Key::new(&format!("{long}a")),
+                Err(KeyError::ComponentTooLong)
+            );
+
+            let deep = vec!["a"; MAX_DEPTH].join("/");
+            assert!(Key::new(&deep).is_ok());
+            assert_eq!(Key::new(&format!("{deep}/a")), Err(KeyError::TooDeep));
+
+            let huge = vec!["a".repeat(100); 11].join("/");
+            assert!(huge.len() > MAX_KEY_LEN);
+            assert_eq!(Key::new(&huge), Err(KeyError::TooLong));
+        }
+
+        #[test]
+        fn join_enforces_caps() {
+            let twenty = key(&vec!["a"; 20].join("/"));
+            assert_eq!(twenty.join(&twenty), Err(KeyError::TooDeep));
+
+            let big = key(&vec!["a".repeat(200); 3].join("/"));
+            assert_eq!(big.join(&big), Err(KeyError::TooLong));
+        }
+
+        #[test]
         fn join() {
-            assert_eq!(key("a").join(&key("b/c")), key("a/b/c"));
-            assert_eq!(key("a/b").join(&key("c")), key("a/b/c"));
+            assert_eq!(key("a").join(&key("b/c")).unwrap(), key("a/b/c"));
+            assert_eq!(key("a/b").join(&key("c")).unwrap(), key("a/b/c"));
 
             let (a, b, c) = (key("a"), key("b/x"), key("c"));
-            assert_eq!(a.join(&b).join(&c), a.join(&b.join(&c)));
+            assert_eq!(
+                a.join(&b).unwrap().join(&c).unwrap(),
+                a.join(&b.join(&c).unwrap()).unwrap()
+            );
         }
 
         #[test]
         fn join_always_nests() {
             let base = key("scope");
             for other in ["a", "a/b", "scope", "x/scope"] {
-                assert!(base.join(&key(other)).starts_with(&base), "{other:?}");
+                assert!(
+                    base.join(&key(other)).unwrap().starts_with(&base),
+                    "{other:?}"
+                );
             }
         }
 

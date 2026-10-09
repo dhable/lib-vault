@@ -12,8 +12,9 @@ the sketch wins and this log is out of date.
 | D31 | Pluggable storage | Object data lives behind a `Store` trait: `list`, `delete`, `open_read`, `open_write`. The filesystem is the first backend; databases, object stores and in-memory stores are also intended. The vault no longer *is* a directory. | §2, §5 |
 | D32 | Pluggable claiming | Exclusion is a separate `Claimer` trait. `try_lock(key)` (renamed from `try_claim` in v6) returns only a lock (`Box<dyn ClaimLock>`); the `Vault` builds the `Claim` from store + key + lock, so claimers outside the crate can be written and never see the store. `Vault::new(store, claimer)`. Resolves P28; supersedes D25, D30. | §2, §6 |
 | D33 | Async-first, runtime-agnostic | No runtime dependency; I/O uses the `futures` traits. **Async trait methods** (`Store::*`, `Claimer::try_lock`) return `futures::future::BoxFuture` (the traits must be usable as `dyn` and promise `Send`). **Async inherent methods** (`Vault::claim`, `Vault::shutdown`, `Claim::list`/`delete`/`open_read`/`open_write`) are `async fn`, which also makes their checks run when polled rather than when called. Release is synchronous (D39). Supersedes D3 and the v2 async plan. | §2, §7, §11 |
-| D34 | `Key` type | Object names are `Key`, an `Arc<str>` newtype in unix path syntax (`a/b/c`), not `Path`. **Strict canonical form**: not empty, no leading/trailing `/`, no `//`, no `.`/`..`, no NUL. One string has exactly one valid spelling. There is no root key (D48). Cheap to clone. | §3 |
-| D35 | `Key::join` | Infallible, and always nests: unlike `Path::join`, the argument can never replace the base. This is what makes scoping a confinement mechanism. | §3 |
+| D34 | `Key` type | Object names are `Key`, an `Arc<str>` newtype in unix path syntax (`a/b/c`), not `Path`. **Strict canonical form**: not empty, no leading/trailing `/`, no `//`, no `.`/`..`, no NUL, plus the name policy and caps (D6). One string has exactly one valid spelling. There is no root key (D48). Cheap to clone. | §3 |
+| D35 | `Key::join` | Always nests: unlike `Path::join`, the argument can never replace the base. This is what makes scoping a confinement mechanism. Returns `Result<Key, KeyError>`: it fails only with `TooDeep`/`TooLong` when the joined key exceeds the caps (D6), so every `Key`, including a claim's resolved full keys, obeys them. `ScopedStore::resolve` and the `Claim` methods propagate it as `Error::Key`. | §3, §4.1 |
+| D6 | Name policy | Applies to **every key and every backend**, enforced by `Key::validate`. Each component uses only `[A-Za-z0-9._ -]`, doesn't start with `-`/space or end with `.`/space, isn't a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`9`, `LPT0`–`9`, with any extension, any case) and doesn't start with `.vault` (any case). Caps: component ≤ `MAX_COMPONENT_LEN` = 255 bytes, ≤ `MAX_DEPTH` = 32 components, ≤ `MAX_KEY_LEN` = 1024 bytes. New `KeyError` variants: `InvalidChar`, `BadComponentStart`, `BadComponentEnd`, `Reserved`, `ComponentTooLong`, `TooDeep`, `TooLong`. The case-collision rule needs stored state, so it's a `Store` contract requirement for every backend (`open_write` must fail when the key differs from an existing one only by ASCII case). Resolves P38. | §3, §5, §10 |
 | D36 | Scoping | `Claim::new` wraps the vault's store in `ScopedStore::new(key, store)`, so every key a claim receives is relative to the claimed key and can't leave it. Resolves P27. | §4.1 |
 | D37 | Claim thread model | `Claim` is `Send` (inferred: no `unsafe impl`, no `negative-impl` dependency). Exclusive use comes from every operation taking **`&mut self`**, and `&mut Claim` is `Send`, so tasks using a claim stay spawnable. `Claim` happens to be `!Sync` (`dyn ClaimLock` isn't `Sync`), but nothing depends on it: a `&Claim` can do nothing. Never `Clone`. Supersedes D27; resolves P18, P32, P33. | §4.2 |
 | D38 | Claim operations | `list`, `delete`, `open_read` (→ `ObjectReader<'a>`), `open_write` (→ `ObjectWriter<'a>`) on keys within the claim. Separate read and write handles, because random-access read/write/seek doesn't map onto object stores. Handles are `pub type ObjectReader<'a> = Pin<Box<dyn AsyncRead + Send + 'a>>` (and the writer equivalent): pinned so the `futures` extension methods work for any backend reader, `Send` so tasks stay spawnable. Resolves P30. Replaces `sub_claim`, `open`/`open_dir`, `Dir`, `StoreObject` (D7, D9, D10, D21, D22). | §4.3, §5 |
@@ -43,7 +44,6 @@ These were core decisions when the vault was filesystem-only. They now describe 
 | # | Topic | Decision | Ref |
 |---|---|---|---|
 | D1 | Syscalls | The core API uses only std and `futures` types. The fs backend may use a syscall crate for `openat2`/`openat`/`fstatat`/`unlinkat`/`renameat`, with its own resolver so link, type and name policies stay ours. | §8.1 |
-| D6 | Name policy | Strict portable ASCII, with reserved-name, length and case-collision rules. Enforced by the fs backend on top of `Key`'s syntax rules (whether to move it into `Key`: P38). | §10 |
 | D16 | Cross-process lock mechanism | `flock` on the vault's own directory/file inodes ("inode-lock v1"): shared locks on ancestors, an exclusive lock on the target, top-down, with verify-after-lock. No lock-file directory and no shared writable metadata. | §8.3 |
 | D17 | Links and special files | Symlinks, multiply-linked regular files, mount crossings, FIFOs/sockets/devices are all refused, with checks done on handles, not paths. | §8.2 |
 | D18 | Non-blocking acquisition | Each `try_lock` is one pass of `try_lock_shared`/`try_lock`; on `WouldBlock` it releases what it took and fails. Never blocks in `flock(2)`. Waiting is the caller's retry loop (D44). | §8.3 |
@@ -80,7 +80,6 @@ These were core decisions when the vault was filesystem-only. They now describe 
 ### API
 | # | Question | Recommendation |
 |---|---|---|
-| P38 | Should `Key` enforce the portable name policy (D6) for every backend, or only the fs backend? | Undecided. |
 
 Known leftovers in the final sketch (not decisions): a stale `REVIEW(nit)` comment above the
 `try_lock` docs (the dead link and unused `executor` feature it mentions are both fixed), and
@@ -96,7 +95,7 @@ any runtime, and must not block or panic (`design.md` §4.4).
 | P10 | ACL support | POSIX ACLs in scope or not |
 | P11 | Optional hardening | dangerous-name denylist, HMAC tamper detection, audit log |
 | P12 | Syscall crate | `rustix` (recommended) vs raw FFI vs `cap-std` |
-| P20 | Case-collision check race (runs under a shared parent lock) | accept and document vs exclusive parent lock for creates |
+| P20 | Case-collision check race: the `Store` case rule (D6) applies to every backend; in the fs backend the check runs under only a shared parent lock, so concurrent `Foo`/`foo` creates can both pass | accept and document vs exclusive parent lock for creates (each backend documents its approach) |
 | P21 | Crash safety for in-place writes (D19) | recommend directory claims + atomic write helper |
 | P22 | Safety of the root's parent directories | sshd StrictModes-style check vs root only |
 | P23 | Verify-after-lock retry limit | count and error |
@@ -125,6 +124,7 @@ any runtime, and must not block or panic (`design.md` §4.4).
 | P47 | `Ok` means the lock is released and the key can be claimed again immediately (D39). |
 | P48 | Sync `Claim::release(self)` returns the error; `Drop` logs it otherwise (D11). |
 | P49 | `Claim::release(self)` consumes the claim, so no claim outlives its lock and shutdown doesn't wait for a separate drop (D11). |
+| P38 | The name policy applies to every key, enforced by `Key::validate`; case collisions are a `Store` rule (D6). |
 | P46 | Same: nothing is run on an executor in `Drop`, so it can't nest (D39). |
 | P2 | Shutdown waits for claims only (D46). |
 | P19 | Moot: the library never waits on a claim (D44). Callers that retry should back off. |
@@ -148,7 +148,7 @@ any runtime, and must not block or panic (`design.md` §4.4).
 | Item | Status in `src/lib.rs` |
 |---|---|
 | Build | ✅ Builds; 10 unit tests pass; `cargo doc` is clean; the `Claim::list` example is `ignore`d; clippy is clean outside the test playground (unused variables, dead code). |
-| D34, D35, D48 `Key` | ✅ Implemented with unit tests; empty keys rejected. |
+| D6, D34, D35, D48 `Key` | ✅ Name policy, caps and fallible `join` implemented with unit tests; empty keys rejected. `Store::open_write` documents the case-collision rule. |
 | D36 scoping | ✅ `Claim::new` wraps the store in `ScopedStore`. |
 | D37 thread model | ✅ `&mut self` methods; compile-time `Claim: Send` test. No `Send` assertion for the `claim()`/`shutdown()` futures (they are `Send`, checked with a probe against v8). |
 | D38, D42 handles | ✅ Public pinned, `Send`, claim-borrowing aliases. |
