@@ -321,21 +321,29 @@ impl Claim {
         self.store.inner.open_write(&resolved_key).await
     }
 
-    /// Releases the underyling Claim lock issued when the Claim was created. This method exposes
-    /// the release status and any error data. If a the Claim owner doesn't call this method, it
-    /// will be called in `drop` and any errors will be logged with the tracing crate.
-    pub fn release(&mut self) -> Result<(), Error> {
-        if let Some(lock) = self.lock.take() {
-            lock.release()?;
-        }
-        Ok(())
+    /// Releases the underyling Claim lock issued when the Claim was created. Use the
+    /// `release` method here instead of relying on `drop` in order to inspect the
+    /// status and/or handle any resulting errors.
+    pub fn release(mut self) -> Result<(), Error> {
+        release_lock(&mut self)
     }
+}
+
+// Helper function that implements the resuable logic around taking the lock from
+// the strut and calling release on it. Must be callable from both the `Drop`
+// implementation as well as `Claim::release`.
+fn release_lock(claim: &mut Claim) -> Result<(), Error> {
+    if let Some(lock) = claim.lock.take() {
+        lock.release()?;
+    }
+    Ok(())
 }
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        let _ = self
-            .release()
+        // Attempt to release the lock if it hasn't been. Funnels errors to the
+        // tracing crate as a best attempt to expose errors.
+        let _ = release_lock(self)
             .map_err(|e| tracing::error!(cause = %e, "ClaimLock::release failed"));
 
         // Now notify any waiting threads if the new outstanding claim count is 0. Make sure

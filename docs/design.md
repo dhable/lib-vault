@@ -93,7 +93,7 @@ things a vault must not (absolute paths, `..`, OS-specific syntax).
   always `Some`). Claimers use `starts_with` for overlap checks; stores use `strip_prefix` to
   return keys relative to the listed key.
 - **Constructors and conversions**: `Key::new`, `FromStr`, `TryFrom<&str>`, `TryFrom<String>`,
-  `AsRef<str>`, `Display`. There is no `Key::root`.
+  `From<&Key>` (a cheap clone), `AsRef<str>`, `Display`. There is no `Key::root`.
 - **Naming the claim itself** (D48): since there's no empty key, the whole vault can't be
   claimed, and a claim refers to its own key with `None` (§4.1).
 - The portable name policy (§10) is enforced by the filesystem backend today. Moving it into
@@ -153,22 +153,31 @@ pub trait ClaimLock: Send {
     fn release(self: Box<Self>) -> Result<(), Error>;
 }
 impl Claim {
-    pub fn release(&mut self) -> Result<(), Error> {
-        if let Some(lock) = self.lock.take() { lock.release()?; }
-        Ok(())
-    }
+    pub fn release(mut self) -> Result<(), Error> { release_lock(&mut self) }
+}   // `self` drops here, so Drop runs and counts down at once
+fn release_lock(claim: &mut Claim) -> Result<(), Error> {
+    if let Some(lock) = claim.lock.take() { lock.release()?; }
+    Ok(())
 }
 impl Drop for Claim {
     fn drop(&mut self) {
-        let _ = self.release().map_err(|e| tracing::error!(cause = %e, "ClaimLock::release failed"));
+        let _ = release_lock(self).map_err(|e| tracing::error!(cause = %e, "ClaimLock::release failed"));
         /* count down; at zero, take the waiters and wake them after unlocking */
     }
 }
 ```
-- **Two ways to give up a claim** (D11): `claim.release()` releases the lock and returns the
-  error, if any; dropping the claim releases it if `release` wasn't called and logs any error
-  with `tracing`. The lock is in an `Option` and `take()`n, so it's released at most once. A
-  lock-less claim (failed or cancelled `try_lock`, §4.5) skips the release.
+- **Two ways to give up a claim** (D11): `claim.release()` consumes the claim, releases the
+  lock and returns the error, if any; dropping the claim releases it and logs any error with
+  `tracing`. Both go through the private `release_lock`, and the lock is an `Option` that is
+  `take()`n, so it's released at most once. A lock-less claim (failed or cancelled `try_lock`,
+  §4.5) skips the release.
+- **No claim outlives its lock** (resolves P49). Because `release` takes `self`, a released claim
+  can't be used for `list`/`delete`/`open_*` any more, and since `self` is dropped at the end of
+  `release`, the outstanding count goes down immediately, so `shutdown` doesn't wait for a
+  separate drop.
+- **Errors can't be retried.** If `ClaimLock::release` fails, the claim is gone anyway; the
+  caller sees the error but can't try again. (The lock object is consumed by its own
+  `release(self: Box<Self>)` regardless.)
 - **Handles first.** Readers and writers borrow the claim mutably, so they must be dropped
   before `release()` or the drop (§4.3).
 - **Release is synchronous and each implementation owns its async work** (D39). The library
@@ -182,10 +191,6 @@ impl Drop for Claim {
   calls `Claim::release` or drops the claim, possibly outside any async runtime, so it must not
   block or panic. `tokio::spawn` panics when no runtime is current, and a panic in `Drop` while
   unwinding aborts the process.
-- **After `release()` the claim object still exists** (`release` takes `&mut self`). It no
-  longer holds a lock, but `list`/`delete`/`open_*` still work on its scoped store, so they are
-  no longer exclusive. It also still counts as outstanding until dropped, so `shutdown` waits
-  for the drop, not the release. Callers should drop the claim right after releasing it (P49).
 - **No implicit flush/sync.** Durability is the caller's job before releasing.
 
 ### 4.5 Shutdown (D13, D41)
@@ -322,7 +327,7 @@ impl Claim {                                              // Send, never Clone
     pub async fn delete(&mut self, key: impl AsKeyRef) -> Result<(), Error>;
     pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<ObjectReader<'a>, Error>;
     pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<ObjectWriter<'a>, Error>;
-    pub fn release(&mut self) -> Result<(), Error>;
+    pub fn release(self) -> Result<(), Error>;
 }
 impl Drop for Claim { /* self.release() (errors logged), then count down */ }
 
@@ -344,8 +349,8 @@ check; `cargo doc` is clean; the `Claim::list` example is `ignore`d. Known lefto
 - doc comments have some typos.
 
 **History.** v9 made `ClaimLock::release` synchronous (it was a `BoxFuture` run with `block_on`
-in `Drop` in v6–v8) and turned `Claim::release` into a sync `&mut self` method (an
-`async fn release(self)` in v5–v8). Removed since v5: `ClaimLock::try_release`, the
+in `Drop` in v6–v8) and made `Claim::release` a sync method; it briefly took `&mut self`,
+and now consumes the claim (`release(self)`), as the v5–v8 `async fn release(self)` did. Removed since v5: `ClaimLock::try_release`, the
 `shutting_down: Arc<AtomicBool>` gate, `Claimer::try_claim` (renamed `try_lock`). Since v4:
 `StoreObject`, `Claim::open`, the claimer building the `Claim`, the `negative-impl` dependency.
 Since v3: `Vault::new(root)` / `new_shared`, `shutdown_timeout`, `Claim<'a>` lifetimes,

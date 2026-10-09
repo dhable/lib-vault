@@ -19,7 +19,7 @@ the sketch wins and this log is out of date.
 | D38 | Claim operations | `list`, `delete`, `open_read` (→ `ObjectReader<'a>`), `open_write` (→ `ObjectWriter<'a>`) on keys within the claim. Separate read and write handles, because random-access read/write/seek doesn't map onto object stores. Handles are `pub type ObjectReader<'a> = Pin<Box<dyn AsyncRead + Send + 'a>>` (and the writer equivalent): pinned so the `futures` extension methods work for any backend reader, `Send` so tasks stay spawnable. Resolves P30. Replaces `sub_claim`, `open`/`open_dir`, `Dir`, `StoreObject` (D7, D9, D10, D21, D22). | §4.3, §5 |
 | D39 | `ClaimLock` release | A claimer's lock has one method, `release(self: Box<Self>) -> Result<()>`: **synchronous and non-blocking**. Each implementation handles its own async work (its own thread or runtime); the library never runs a future in `release` or `Drop`. **`Ok` means the lock is released**, so the same key can be claimed again immediately. Called from `Claim::release` or `Claim::drop`. Supersedes the v6–v8 async `release` run with `block_on` in `Drop`. Resolves P44, P46, P47. | §4.4, §6 |
 | D40 | `list` result | `Vec<Key>`, relative to the listed key; "prefix" means component prefix. `claim.list(None)` lists everything in the claim (D48). Resolves P31. | §5 |
-| D11 | Giving up a claim | `Claim::release(&mut self) -> Result<()>` releases the lock and returns any error. `Drop` calls the same `release` if it wasn't called and logs errors with `tracing`. The lock is an `Option<Box<dyn ClaimLock>>` that is `take()`n, so it's released at most once, and a lock-less claim (failed or cancelled `try_lock`, D47) skips it. The claim still counts as outstanding until dropped. Resolves P48. | §4.4 |
+| D11 | Giving up a claim | `Claim::release(self) -> Result<()>` consumes the claim, releases the lock and returns any error. Dropping a claim releases the lock if `release` wasn't called and logs errors with `tracing`. Both go through a private `release_lock`; the lock is an `Option<Box<dyn ClaimLock>>` that is `take()`n, so it's released at most once, and a lock-less claim (failed or cancelled `try_lock`, D47) skips it. Because `release` consumes the claim, no claim outlives its lock, and the outstanding count drops as soon as `release` returns. A failed release can't be retried. Resolves P48, P49. | §4.4 |
 | D41 | Shutdown state | One `Arc<Mutex<VaultState { shutting_down, outstanding_claims, waiters: Vec<Waker> }>>` shared by every `Vault` clone and every `Claim` replaces the `AtomicBool` gate, so the flag and the count can't be observed out of step. `claim` checks the flag and counts up under the mutex, then drops the guard **before** awaiting `try_lock` (so its future is `Send` and can't block other threads on the mutex); counting up first makes shutdown wait for in-flight claims. `Claim::drop` releases the lock if still held, counts down, and wakes the waiters, after unlocking, when the count reaches zero. `shutdown` sets the flag and awaits a `poll_fn` that is `Ready` at zero and otherwise registers its waker (deduplicated with `will_wake`). Resolves P35, P42, P43. | §4.5 |
 | D47 | In-flight claim accounting | `Vault::claim` builds the `Claim` (lock-less) under the mutex right after counting up, awaits `try_lock`, then `set_lock`s it. If `try_lock` fails or the `claim` future is dropped, the lock-less `Claim` is dropped and its `Drop` counts down, so refused and cancelled claims never leak a count. Resolves P45. | §4.5 |
 | D48 | No root key | The empty string is not a valid `Key` (`KeyError::Empty`); `Key::root`/`is_root` are gone, so the whole vault can't be claimed. A claim refers to its own key with `None`: `Claim::list`, `delete`, `open_read` and `open_write` take `key: impl AsKeyRef`, implemented for `&str` (validated with `Key::new`; invalid → `Error::Key`), `&Key` and `Option<&Key>`, where `None` means the claimed key itself. No impl for owned `Key` (pass `&key`), and a single `Option` impl so a bare `None` infers. `Store` still takes `&Key`, so backends always receive a full, non-empty key; `Claim` resolves `None`/`Some` via `ScopedStore::resolve`. Consequences: `join` always nests (`a` + `b` = `a/b`); `strip_prefix` of a key by itself is `None`; `parent` of a single-component key is `None`. Resolves P6. | §3, §4.1 |
@@ -71,7 +71,7 @@ These were core decisions when the vault was filesystem-only. They now describe 
 | v4 `Claimer::try_claim(store, key) -> Claim` | Claimer builds the claim | D32 |
 | v5 `ClaimLock::try_release` | Best-effort release from `Drop` | D39 (one synchronous `release`) |
 | v6–v8 async `ClaimLock::release` | `BoxFuture` release; `Drop` ran it with `futures::executor::block_on` (panicked inside a `futures` executor) | D39 (synchronous, non-blocking release) |
-| v5–v8 `Claim::release` | `async fn release(self)` that consumed the claim and awaited the lock's release | D11 (sync `release(&mut self)`) |
+| v5–v8 `Claim::release` | `async fn release(self)` that consumed the claim and awaited the lock's release | D11 (sync `release(self)`) |
 | v4–v9 `type Error = Box<dyn Error (+ Send + Sync)>` | Placeholder error alias | D12 (`thiserror` enum) |
 | v5 `shutting_down: Arc<AtomicBool>` | Shutdown gate as an atomic, re-checked after the lock was granted | D41 (one mutex over flag + count) |
 
@@ -80,7 +80,6 @@ These were core decisions when the vault was filesystem-only. They now describe 
 ### API
 | # | Question | Recommendation |
 |---|---|---|
-| P49 | After `Claim::release(&mut self)` the claim object still exists without a lock: `list`/`delete`/`open_*` still work on its scoped store but are no longer exclusive, and it still counts as outstanding until dropped, so `shutdown` waits for the drop. | Accepted in the final sketch. Document "drop the claim right after `release`"; an implementation could make the methods fail once the lock is gone, or `release` could consume `self`. |
 | P38 | Should `Key` enforce the portable name policy (D6) for every backend, or only the fs backend? | Undecided. |
 
 Known leftovers in the final sketch (not decisions): a stale `REVIEW(nit)` comment above the
@@ -124,7 +123,8 @@ any runtime, and must not block or panic (`design.md` §4.4).
 | P41 | `try_release` removed; a single synchronous `release` (D39). |
 | P44 | No `block_on` in `Drop` any more; `release` is synchronous and non-blocking (D39). |
 | P47 | `Ok` means the lock is released and the key can be claimed again immediately (D39). |
-| P48 | Sync `Claim::release(&mut self)` returns the error; `Drop` logs it otherwise (D11). |
+| P48 | Sync `Claim::release(self)` returns the error; `Drop` logs it otherwise (D11). |
+| P49 | `Claim::release(self)` consumes the claim, so no claim outlives its lock and shutdown doesn't wait for a separate drop (D11). |
 | P46 | Same: nothing is run on an executor in `Drop`, so it can't nest (D39). |
 | P2 | Shutdown waits for claims only (D46). |
 | P19 | Moot: the library never waits on a claim (D44). Callers that retry should back off. |
@@ -153,7 +153,7 @@ any runtime, and must not block or panic (`design.md` §4.4).
 | D37 thread model | ✅ `&mut self` methods; compile-time `Claim: Send` test. No `Send` assertion for the `claim()`/`shutdown()` futures (they are `Send`, checked with a probe against v8). |
 | D38, D42 handles | ✅ Public pinned, `Send`, claim-borrowing aliases. |
 | D43 object semantics | ✅ Documented on `Claim` and on `Store`. |
-| D39, D11 release | ✅ Sync `ClaimLock::release` with a documented `Ok` contract; sync `Claim::release(&mut self)` returns errors; `Drop` releases if needed and logs errors. Claims after `release` keep working without a lock (P49). |
+| D39, D11 release | ✅ Sync `ClaimLock::release` with a documented `Ok` contract; `Claim::release(self)` consumes the claim and returns errors; `Drop` releases if needed and logs errors. |
 | D44, D45 `Claimer` | ✅ Documented. |
 | D48 optional keys | ✅ `Claim::list/delete/open_read/open_write` take `impl AsKeyRef` (`&str`, `&Key`, `Option<&Key>`); `Store` takes `&Key`. |
 | D41, D46, D47 shutdown | ✅ Guard dropped before `.await`; refused/cancelled claims give their count back; `Drop` counts down and wakes waiters; shutting down returns `Error::ShuttingDown`. |
