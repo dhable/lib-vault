@@ -1,6 +1,6 @@
 # lib-vault — Design
 
-Status: **API sketch final (v9)**; implementation not started. The sketch in `src/lib.rs` is
+Status: **API sketch final (v9)**; implementation not started. The sketch in the `lib-vault` crate (`lib-vault/src/`) is
 the source of truth. Decision log and open questions: [`decisions.md`](decisions.md).
 
 ## Purpose
@@ -274,7 +274,7 @@ pub trait Claimer: Send + Sync + 'static {
     fn try_lock<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<Box<dyn ClaimLock>, Error>>;
 }
 ```
-These are documented on the traits in `src/lib.rs`:
+These are documented on the traits in `lib-vault/src/claimer.rs`:
 - **Exclusive only** (D2). **The claimer only locks** (D32): it returns a `ClaimLock`, and the
   vault builds the `Claim`.
 - **Exclusion** (D44, resolves P36): a claim on `k` covers `k` and every key beneath it,
@@ -298,7 +298,7 @@ These are documented on the traits in `src/lib.rs`:
 
 ## 7. Public API
 
-Final sketch (`src/lib.rs`), abbreviated:
+Final sketch (`lib-vault/src/`), abbreviated:
 
 ```rust
 #[derive(Debug, thiserror::Error)]
@@ -363,10 +363,12 @@ trait using `async fn` can't be used as `dyn Trait` and can't promise its future
 An `async fn`'s `Send`-ness is inferred, so it can be lost silently (as the v6 `claim`, which
 held a `MutexGuard` across `.await`, showed); §13 asserts it.
 
-**Build status:** builds; the 10 unit tests pass, including a compile-time `Claim: Send`
-check; `cargo doc` is clean; the `Claim::list` example is `ignore`d. Known leftovers:
+**Build status:** the workspace builds; `lib-vault`'s 27 unit tests pass, including a
+compile-time `Claim: Send` check; clippy is clean; the `Claim::list` example is `ignore`d.
+Known leftovers:
+- `cargo doc` warns about two unresolved links in `claimer.rs` (`[`Claim`]` and `[`Store`]`
+  aren't in scope in that module since the code was split into modules);
 - a stale `REVIEW(nit)` comment above the `try_lock` docs (what it flags is fixed);
-- the test playground's `MemStore`/`MemClaimer` give unused-variable and dead-code warnings;
 - doc comments have some typos.
 
 **History.** v9 made `ClaimLock::release` synchronous (it was a `BoxFuture` run with `block_on`
@@ -520,7 +522,18 @@ Async is the base API (D33), not a later addition. Notes carried over from the o
 - **Cancellation**: dropping a `claim()` future must release any partially acquired locks.
 - **Blocking work**: backends with blocking syscalls need somewhere to run them (P39).
 
-## 12. Module layout (when coding starts)
+## 12. Workspace and module layout
+
+The repository is a Cargo workspace (D49). The root `Cargo.toml` lists the members; `docs/`,
+`Cargo.lock` and `target/` are shared at the root.
+
+| Crate | Contents |
+|---|---|
+| `lib-vault` | the core API: `Vault`, `Claim`, `Key`, the `Store` / `Claimer` / `ClaimLock` traits, `ScopedStore`, `Error` |
+| `lib-vault-posix` | *(empty)* the filesystem backend: `FsStore`, `FlockClaimer` (§8) |
+| `lib-vault-memory` | *(empty)* the in-memory backend: `Store` + `Claimer` + `ClaimLock`, also the test double |
+
+Modules in `lib-vault/src/`:
 
 | Module | Contents |
 |---|---|
@@ -531,13 +544,14 @@ Async is the base API (D33), not a later addition. Notes carried over from the o
 | `claim.rs` | `Claim`, release / `Drop` |
 | `store.rs` | `Store`, `ScopedStore`, `ObjectReader` / `ObjectWriter` |
 | `claimer.rs` | `Claimer`, `ClaimLock` |
-| `backend/fs/` | `FsStore`, `FlockClaimer`, case-collision check, inode-lock v1, registry, `sys/{linux,macos}.rs` |
-| `backend/memory.rs` *(likely)* | in-memory `Store` + `Claimer` + `ClaimLock`, also useful as the test double |
-| `benches/` *(future)* | fs performance harness (D28, P26) |
+
+The planned `lib-vault-posix` layout: `FsStore`, `FlockClaimer`, the case-collision check,
+inode-lock v1, the in-process registry, `sys/{linux,macos}.rs`, and *(future)* `benches/` for
+the performance harness (D28, P26).
 
 ## 13. Verification strategy
 
-- **`Key`** (done, unit tests in `src/lib.rs`): canonical keys accepted, each rejection case,
+- **`Key`** (done, unit tests in `lib-vault/src/key.rs`): canonical keys accepted, each rejection case,
   the empty key rejected, each name-policy rule (characters, leading/trailing characters,
   reserved names in any case, `.vault`), the caps at and just over their limits, `join`
   failing with `TooDeep`/`TooLong`, join associativity, join always nests, component-wise

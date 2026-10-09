@@ -1,7 +1,7 @@
 # lib-vault — Design Decisions
 
 Companion to [`design.md`](design.md). Section references (§) point there.
-`src/lib.rs` (API sketch v9, final) is the source of truth; where this log and the sketch disagree,
+The `lib-vault` crate (`lib-vault/src/`, API sketch v9, final) is the source of truth; where this log and the sketch disagree,
 the sketch wins and this log is out of date.
 
 ## Decisions made
@@ -24,6 +24,7 @@ the sketch wins and this log is out of date.
 | D41 | Shutdown state | One `Arc<Mutex<VaultState { shutting_down, outstanding_claims, waiters: Vec<Waker> }>>` shared by every `Vault` clone and every `Claim` replaces the `AtomicBool` gate, so the flag and the count can't be observed out of step. `claim` checks the flag and counts up under the mutex, then drops the guard **before** awaiting `try_lock` (so its future is `Send` and can't block other threads on the mutex); counting up first makes shutdown wait for in-flight claims. `Claim::drop` releases the lock if still held, counts down, and wakes the waiters, after unlocking, when the count reaches zero. `shutdown` sets the flag and awaits a `poll_fn` that is `Ready` at zero and otherwise registers its waker (deduplicated with `will_wake`). Resolves P35, P42, P43. | §4.5 |
 | D47 | In-flight claim accounting | `Vault::claim` builds the `Claim` (lock-less) under the mutex right after counting up, awaits `try_lock`, then `set_lock`s it. If `try_lock` fails or the `claim` future is dropped, the lock-less `Claim` is dropped and its `Drop` counts down, so refused and cancelled claims never leak a count. Resolves P45. | §4.5 |
 | D48 | No root key | The empty string is not a valid `Key` (`KeyError::Empty`); `Key::root`/`is_root` are gone, so the whole vault can't be claimed. A claim refers to its own key with `None`: `Claim::list`, `delete`, `open_read` and `open_write` take `key: impl AsKeyRef`, implemented for `&str` (validated with `Key::new`; invalid → `Error::Key`), `&Key` and `Option<&Key>`, where `None` means the claimed key itself. No impl for owned `Key` (pass `&key`), and a single `Option` impl so a bare `None` infers. `Store` still takes `&Key`, so backends always receive a full, non-empty key; `Claim` resolves `None`/`Some` via `ScopedStore::resolve`. Consequences: `join` always nests (`a` + `b` = `a/b`); `strip_prefix` of a key by itself is `None`; `parent` of a single-component key is `None`. Resolves P6. | §3, §4.1 |
+| D49 | Workspace layout | A Cargo workspace: `lib-vault` (the core API, all existing code), `lib-vault-posix` (the filesystem backend, D16–D19, D24, D28, D29) and `lib-vault-memory` (the in-memory backend and test double). Backends are separate crates so the core doesn't pull in platform or syscall dependencies. Both backend crates are empty for now. | §12 |
 | D42 | Handle lifetimes | `open_read`/`open_write` take `&'a mut self` and return handles borrowing `'a`, so a claim can't be released or dropped while a handle is alive (compile error E0505), and a claim has at most one open handle at a time, with no `list`/`delete` meanwhile. Accepted. Resolves P29. | §4.3 |
 | D43 | Object semantics | `delete` of a missing key succeeds (like HTTP `DELETE`); `open_read` of a missing key is an error; `open_write` creates or overwrites. When written data is committed/flushed, and what happens to in-flight writes after release, is documented by each `Store`. `list` has no paging or limits in the first revision. | §5 |
 | D44 | Claim conflicts | Documented on `Claimer`: a claim covers its key and everything beneath it (component-wise, `Key::starts_with`); conflicts go both ways (descendants *and* ancestors); disjoint keys don't conflict; exclusion holds across tasks, `Vault`s and processes. `try_lock` **never waits**: one attempt, an error on conflict; callers retry with their own backoff/timeout. Dropping the future releases anything partially acquired. Resolves P36, P40; makes P19 moot. | §6 |
@@ -143,11 +144,11 @@ any runtime, and must not block or panic (`design.md` §4.4).
 | P18 | Moot: nothing depends on `Claim` being `!Sync` (D37). |
 | V2-1…V2-8 | The v2 async plan is replaced by async-first (D33). Still-relevant hazards are carried in §11. |
 
-## Alignment of `src/lib.rs` (final sketch, v9) with decisions
+## Alignment of `lib-vault/src/` (final sketch, v9) with decisions
 
-| Item | Status in `src/lib.rs` |
+| Item | Status in `lib-vault/src/` |
 |---|---|
-| Build | ✅ Builds; 10 unit tests pass; `cargo doc` is clean; the `Claim::list` example is `ignore`d; clippy is clean outside the test playground (unused variables, dead code). |
+| Build | ✅ Workspace builds; `lib-vault`'s 27 unit tests pass; clippy is clean; the `Claim::list` example is `ignore`d. ⚠ `cargo doc` warns about two unresolved links (`Claim`, `Store`) in `claimer.rs` after the module split. |
 | D6, D34, D35, D48 `Key` | ✅ Name policy, caps and fallible `join` implemented with unit tests; empty keys rejected. `Store::open_write` documents the case-collision rule. |
 | D36 scoping | ✅ `Claim::new` wraps the store in `ScopedStore`. |
 | D37 thread model | ✅ `&mut self` methods; compile-time `Claim: Send` test. No `Send` assertion for the `claim()`/`shutdown()` futures (they are `Send`, checked with a probe against v8). |
