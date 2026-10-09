@@ -364,10 +364,8 @@ An `async fn`'s `Send`-ness is inferred, so it can be lost silently (as the v6 `
 held a `MutexGuard` across `.await`, showed); §13 asserts it.
 
 **Build status:** the workspace builds; `lib-vault`'s 27 unit tests pass, including a
-compile-time `Claim: Send` check; clippy is clean; the `Claim::list` example is `ignore`d.
-Known leftovers:
-- `cargo doc` warns about two unresolved links in `claimer.rs` (`[`Claim`]` and `[`Store`]`
-  aren't in scope in that module since the code was split into modules);
+compile-time `Claim: Send` check; clippy and `cargo doc` are clean; the `Claim::list` example
+is `ignore`d. Known leftovers:
 - a stale `REVIEW(nit)` comment above the `try_lock` docs (what it flags is fixed);
 - doc comments have some typos.
 

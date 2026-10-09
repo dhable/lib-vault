@@ -21,8 +21,8 @@ pub trait ClaimLock: Send {
 /// and holds a lock on it while the claim is alive.
 ///
 /// The `Vault` calls [`Claimer::try_lock`] when a caller asks for a claim. If it succeeds,
-/// the vault wraps the returned [`ClaimLock`] in a [`Claim`] scoped to the key. A `Claimer`
-/// only locks; it never touches object data, which belongs to the [`Store`].
+/// the vault wraps the returned [`ClaimLock`] in a [`Claim`](crate::Claim) scoped to the key. A `Claimer`
+/// only locks; it never touches object data, which belongs to the [`Store`](crate::Store).
 ///
 /// # Exclusion
 ///
