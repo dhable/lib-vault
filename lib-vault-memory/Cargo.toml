@@ -4,3 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+lib-vault.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+futures = { workspace = true, features = ["executor"] }

@@ -532,7 +532,7 @@ root.
 |---|---|
 | `lib-vault` | the core API: `Vault`, `Claim`, `Key`, the `Store` / `Claimer` / `ClaimLock` traits, `ScopedStore`, `Error` |
 | `lib-vault-posix` | *(empty)* the filesystem backend: `FsStore`, `FlockClaimer` (§8) |
-| `lib-vault-memory` | *(empty)* the in-memory backend: `Store` + `Claimer` + `ClaimLock`, also the test double |
+| `lib-vault-memory` | the in-memory backend for tests and getting started (D51): `MemoryStore`, `MemoryClaimer`, `vault()`; integration tests in `tests/` exercise the core API against it |
 
 Modules in `lib-vault/src/`:
 
