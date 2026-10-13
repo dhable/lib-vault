@@ -4,10 +4,10 @@
 mod common;
 
 use common::*;
-use lib_vault::{Error, Vault};
+use lib_vault::{Error, Vault, rt};
 use lib_vault_memory::{MemoryClaimer, MemoryStore};
 
-fn refused(v: &Vault, k: &str) -> bool {
+fn refused(v: &Vault<rt::SharedMode>, k: &str) -> bool {
     match block_on(v.claim(key(k))) {
         Err(Error::AlreadyClaimed { key: refused }) => {
             assert_eq!(refused, key(k));

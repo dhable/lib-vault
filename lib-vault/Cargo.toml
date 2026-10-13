@@ -7,3 +7,4 @@ edition.workspace = true
 tracing.workspace = true
 futures.workspace = true
 thiserror.workspace = true
+bytes.workspace = true

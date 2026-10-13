@@ -43,11 +43,11 @@ mod store;
 pub use claimer::MemoryClaimer;
 pub use store::MemoryStore;
 
-use lib_vault::{Key, Vault};
+use lib_vault::{Key, Vault, rt};
 use std::io;
 
 /// A `Vault` backed by a new [`MemoryStore`] and [`MemoryClaimer`].
-pub fn vault() -> Vault {
+pub fn vault() -> Vault<rt::SharedMode> {
     Vault::new(MemoryStore::new(), MemoryClaimer::new())
 }
 

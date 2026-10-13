@@ -1,7 +1,8 @@
 use crate::MemoryError;
 use futures::future::{self, BoxFuture};
 use futures::io::{AsyncWrite, Cursor};
-use lib_vault::{Error, Key, ObjectReader, ObjectWriter, Store};
+use lib_vault::rt::shared::{ObjectReader, ObjectWriter};
+use lib_vault::{Error, Key, Store, rt};
 use std::collections::BTreeMap;
 use std::io;
 use std::pin::Pin;
@@ -49,7 +50,7 @@ fn collision_error(key: &Key, existing: Key) -> MemoryError {
     }
 }
 
-impl Store for MemoryStore {
+impl Store<rt::SharedMode> for MemoryStore {
     fn list(&self, key: &Key) -> BoxFuture<'_, Result<Vec<Key>, Error>> {
         let objects = self.objects.lock().expect("lock poisoned");
         let keys = objects.keys().filter_map(|k| k.strip_prefix(key)).collect();

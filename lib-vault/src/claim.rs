@@ -1,6 +1,4 @@
-use crate::{
-    AsKeyRef, ClaimLock, Error, Key, KeyError, ObjectReader, ObjectWriter, Store, VaultState,
-};
+use crate::{AsKeyRef, ClaimLock, Error, Key, KeyError, Store, VaultState, rt};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
@@ -12,17 +10,17 @@ use std::task::Waker;
 /// any purpose (e.g. `Claim` does not impelemtn `Sync`). This is done by requiring a mutable
 /// reference to use any method on the `Claim`. It does not mean that every method changes the
 /// state of the object.
-pub struct Claim {
+pub struct Claim<M: rt::IoMode> {
     base: Key,
-    store: Arc<dyn Store>,
+    store: Arc<dyn Store<M>>,
     lock: Option<Box<dyn ClaimLock>>,
     state: Arc<Mutex<VaultState>>,
 }
 
-impl Claim {
+impl<M: rt::IoMode> Claim<M> {
     // Create a new claim instance with the `Store` keys scoped to `base`. Intended
     // to be used by `Vault` to create a claim after a claim's lock is obtained.
-    pub(crate) fn new(store: Arc<dyn Store>, base: Key, state: Arc<Mutex<VaultState>>) -> Self {
+    pub(crate) fn new(store: Arc<dyn Store<M>>, base: Key, state: Arc<Mutex<VaultState>>) -> Self {
         Self {
             store,
             base,
@@ -70,10 +68,7 @@ impl Claim {
     /// Opens a specific object at `base` + `key` for reading. The resulting reader is valid
     /// for the duration of the claim. Reading a key that does not point an object will return
     /// an error. `None` means the claimed key itself.
-    pub async fn open_read<'a>(
-        &'a mut self,
-        key: impl AsKeyRef,
-    ) -> Result<ObjectReader<'a>, Error> {
+    pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<M::Reader<'a>, Error> {
         let key = key.into_key()?;
         let resolved_key = resolve_key(&self.base, key.as_ref())?;
         self.store.open_read(&resolved_key).await
@@ -87,10 +82,7 @@ impl Claim {
     /// Writing to a key pointing at an existing object should overwrite the exiting object data.
     /// Writing to a key that does not have an object will create the object with the given key.
     /// `None` means the claimed key itself.
-    pub async fn open_write<'a>(
-        &'a mut self,
-        key: impl AsKeyRef,
-    ) -> Result<ObjectWriter<'a>, Error> {
+    pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<M::Writer<'a>, Error> {
         let key = key.into_key()?;
         let resolved_key = resolve_key(&self.base, key.as_ref())?;
         self.store.open_write(&resolved_key).await
@@ -112,14 +104,14 @@ fn resolve_key(base: &Key, key: Option<&Key>) -> Result<Key, KeyError> {
 // Helper function that implements the resuable logic around taking the lock from
 // the strut and calling release on it. Must be callable from both the `Drop`
 // implementation as well as `Claim::release`.
-fn release_lock(claim: &mut Claim) -> Result<(), Error> {
+fn release_lock<M: rt::IoMode>(claim: &mut Claim<M>) -> Result<(), Error> {
     if let Some(lock) = claim.lock.take() {
         lock.release()?;
     }
     Ok(())
 }
 
-impl Drop for Claim {
+impl<M: rt::IoMode> Drop for Claim<M> {
     fn drop(&mut self) {
         // Attempt to release the lock if it hasn't been. Funnels errors to the
         // tracing crate as a best attempt to expose errors.
@@ -152,22 +144,33 @@ mod tests {
         fn test_send_marker() {
             // This test is just a compile time guard to ensure that `Claim` will implement `Send`.
             // This is our guarantee that changes to `Claim` do not elminate this implict marker.
-            const _: () = {
-                const fn assert_send<T: Send>() {}
-                assert_send::<Claim>()
-            };
+            // `Send` can only be proven for concrete types, so every `IoMode` is checked.
+            use crate::rt::{IoMode, OwnedMode, SharedMode};
+            use crate::{Key, Vault};
+
+            fn assert_send<T: Send>() {}
+            fn assert_vault<T: Send + Sync + Clone>() {}
+            fn assert_send_value<T: Send>(_: &T) {}
+
+            fn mode<M: IoMode>()
+            where
+                Claim<M>: Send,
+                Vault<M>: Send + Sync + Clone,
+            {
+                assert_send::<Claim<M>>();
+                assert_vault::<Vault<M>>();
+            }
+            mode::<SharedMode>();
+            mode::<OwnedMode>();
 
             // `Vault` is shared across threads, and its futures must stay spawnable on
             // multi-threaded runtimes (design §13).
-            fn assert_vault<T: Send + Sync + Clone>() {}
-            assert_vault::<crate::Vault>();
-
-            fn assert_send_value<T: Send>(_: &T) {}
-            fn futures_are_send(vault: crate::Vault) {
-                assert_send_value(&vault.claim(crate::Key::new("a").unwrap()));
+            fn futures_are_send<M: IoMode>(vault: Vault<M>) {
+                assert_send_value(&vault.claim(Key::new("a").unwrap()));
                 assert_send_value(&vault.shutdown());
             }
-            let _ = futures_are_send;
+            let _ = futures_are_send::<SharedMode>;
+            let _ = futures_are_send::<OwnedMode>;
         }
     }
 }

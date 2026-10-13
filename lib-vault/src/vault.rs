@@ -1,4 +1,4 @@
-use crate::{Claim, Claimer, Error, Key, Store};
+use crate::{Claim, Claimer, Error, Key, Store, rt};
 use std::future;
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
@@ -14,17 +14,16 @@ pub(crate) struct VaultState {
 
 /// The Vault is the entry point to setting up storage and a locking strategy for
 /// working with long lived data.
-#[derive(Clone)]
-pub struct Vault {
-    store: Arc<dyn Store>,
+pub struct Vault<M: rt::IoMode> {
+    store: Arc<dyn Store<M>>,
     claimer: Arc<dyn Claimer>,
     state: Arc<Mutex<VaultState>>,
 }
 
-impl Vault {
+impl<M: rt::IoMode> Vault<M> {
     /// Creates a new Vault given an implementation of a storage engine `store` and
     /// a claim locking engine `claimer`.
-    pub fn new(store: impl Store, claimer: impl Claimer) -> Self {
+    pub fn new(store: impl Store<M>, claimer: impl Claimer) -> Self {
         Self {
             store: Arc::new(store),
             claimer: Arc::new(claimer),
@@ -36,7 +35,7 @@ impl Vault {
     /// object path asychronously. This can result in either a valid `Claim` object, which
     /// provides exclusive access to the path and it's subpaths. Can result in an error
     /// if a claim cannot be obtained.
-    pub async fn claim(&self, key: Key) -> Result<Claim, Error> {
+    pub async fn claim(&self, key: Key) -> Result<Claim<M>, Error> {
         let mut claim = {
             // Do all the state updates and drop the guard before an await boundry. This also
             // avoids a possible deadlock on a single threaded execution pool.
@@ -78,10 +77,21 @@ impl Vault {
     }
 }
 
+impl<M: rt::IoMode> Clone for Vault<M> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            claimer: self.claimer.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClaimLock, ObjectReader, ObjectWriter};
+    use crate::ClaimLock;
+    use crate::rt::shared::{ObjectReader, ObjectWriter};
     use futures::FutureExt;
     use futures::future::{self, BoxFuture};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -89,7 +99,7 @@ mod tests {
     // A store the claim never uses in these tests.
     struct NullStore;
 
-    impl Store for NullStore {
+    impl Store<rt::SharedMode> for NullStore {
         fn list(&self, _: &Key) -> BoxFuture<'_, Result<Vec<Key>, Error>> {
             Box::pin(future::ready(Ok(Vec::new())))
         }
@@ -144,7 +154,7 @@ mod tests {
         }
     }
 
-    fn counting_vault(fail: bool) -> (Vault, Arc<AtomicUsize>) {
+    fn counting_vault(fail: bool) -> (Vault<rt::SharedMode>, Arc<AtomicUsize>) {
         let releases = Arc::new(AtomicUsize::new(0));
         let claimer = CountingClaimer {
             releases: releases.clone(),
@@ -153,7 +163,7 @@ mod tests {
         (Vault::new(NullStore, claimer), releases)
     }
 
-    fn claim(vault: &Vault) -> Claim {
+    fn claim<M: rt::IoMode>(vault: &Vault<M>) -> Claim<M> {
         let key = Key::new("a").unwrap();
         vault.claim(key).now_or_never().unwrap().unwrap()
     }

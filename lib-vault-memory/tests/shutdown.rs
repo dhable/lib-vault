@@ -3,12 +3,12 @@
 mod common;
 
 use common::*;
-use lib_vault::{Error, Vault};
+use lib_vault::{Error, Vault, rt};
 use lib_vault_memory::{MemoryClaimer, MemoryStore};
 use std::thread;
 use std::time::Duration;
 
-fn spawn_shutdown(v: &Vault) -> thread::JoinHandle<()> {
+fn spawn_shutdown(v: &Vault<rt::SharedMode>) -> thread::JoinHandle<()> {
     let v = v.clone();
     thread::spawn(move || block_on(v.shutdown()))
 }
