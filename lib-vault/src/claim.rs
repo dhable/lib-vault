@@ -1,5 +1,5 @@
 use crate::{
-    AsKeyRef, ClaimLock, Error, Key, ObjectReader, ObjectWriter, ScopedStore, Store, VaultState,
+    AsKeyRef, ClaimLock, Error, Key, KeyError, ObjectReader, ObjectWriter, Store, VaultState,
 };
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
@@ -13,7 +13,8 @@ use std::task::Waker;
 /// reference to use any method on the `Claim`. It does not mean that every method changes the
 /// state of the object.
 pub struct Claim {
-    store: ScopedStore,
+    base: Key,
+    store: Arc<dyn Store>,
     lock: Option<Box<dyn ClaimLock>>,
     state: Arc<Mutex<VaultState>>,
 }
@@ -22,9 +23,12 @@ impl Claim {
     // Create a new claim instance with the `Store` keys scoped to `base`. Intended
     // to be used by `Vault` to create a claim after a claim's lock is obtained.
     pub(crate) fn new(store: Arc<dyn Store>, base: Key, state: Arc<Mutex<VaultState>>) -> Self {
-        let store = ScopedStore::new(base, store);
-        let lock = None;
-        Self { store, lock, state }
+        Self {
+            store,
+            base,
+            lock: None,
+            state,
+        }
     }
 
     // Helper method that allows setting the lock object after construction. We do this
@@ -49,8 +53,8 @@ impl Claim {
     /// `None` lists everything in the claim.
     pub async fn list(&mut self, prefix: impl AsKeyRef) -> Result<Vec<Key>, Error> {
         let prefix = prefix.into_key()?;
-        let resolved_key = self.store.resolve(prefix.as_ref())?;
-        self.store.inner.list(&resolved_key).await
+        let resolved_key = resolve_key(&self.base, prefix.as_ref())?;
+        self.store.list(&resolved_key).await
     }
 
     /// Deletes a specific object stored at `base` + `key`. Calling this method with a
@@ -59,8 +63,8 @@ impl Claim {
     /// `None` means the claimed key itself.
     pub async fn delete(&mut self, key: impl AsKeyRef) -> Result<(), Error> {
         let key = key.into_key()?;
-        let resolved_key = self.store.resolve(key.as_ref())?;
-        self.store.inner.delete(&resolved_key).await
+        let resolved_key = resolve_key(&self.base, key.as_ref())?;
+        self.store.delete(&resolved_key).await
     }
 
     /// Opens a specific object at `base` + `key` for reading. The resulting reader is valid
@@ -71,8 +75,8 @@ impl Claim {
         key: impl AsKeyRef,
     ) -> Result<ObjectReader<'a>, Error> {
         let key = key.into_key()?;
-        let resolved_key = self.store.resolve(key.as_ref())?;
-        self.store.inner.open_read(&resolved_key).await
+        let resolved_key = resolve_key(&self.base, key.as_ref())?;
+        self.store.open_read(&resolved_key).await
     }
 
     /// Opens a specific object at `base` + `key` for writing. The specific beahviors around when
@@ -88,8 +92,8 @@ impl Claim {
         key: impl AsKeyRef,
     ) -> Result<ObjectWriter<'a>, Error> {
         let key = key.into_key()?;
-        let resolved_key = self.store.resolve(key.as_ref())?;
-        self.store.inner.open_write(&resolved_key).await
+        let resolved_key = resolve_key(&self.base, key.as_ref())?;
+        self.store.open_write(&resolved_key).await
     }
 
     /// Releases the underyling Claim lock issued when the Claim was created. Use the
@@ -98,6 +102,11 @@ impl Claim {
     pub fn release(mut self) -> Result<(), Error> {
         release_lock(&mut self)
     }
+}
+
+// The full key for an optional key relative to `base`; `None` is `base` itself.
+fn resolve_key(base: &Key, key: Option<&Key>) -> Result<Key, KeyError> {
+    key.map_or_else(|| Ok(base.clone()), |k| base.join(k))
 }
 
 // Helper function that implements the resuable logic around taking the lock from
