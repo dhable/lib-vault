@@ -1,32 +1,33 @@
 # lib-vault — Design Decisions
 
 Companion to [`design.md`](design.md). Section references (§) point there.
-The `lib-vault` crate (`lib-vault/src/`, API sketch v9, final) is the source of truth; where this log and the sketch disagree,
+The `lib-vault` crate (`lib-vault/src/`, API sketch v10) is the source of truth; where this log and the sketch disagree,
 the sketch wins and this log is out of date.
 
 ## Decisions made
 
-### Core API (final sketch, v9)
+### Core API (sketch v10)
 | # | Topic | Decision | Ref |
 |---|---|---|---|
 | D31 | Pluggable storage | Object data lives behind a `Store` trait: `list`, `delete`, `open_read`, `open_write`. The filesystem is the first backend; databases, object stores and in-memory stores are also intended. The vault no longer *is* a directory. | §2, §5 |
 | D32 | Pluggable claiming | Exclusion is a separate `Claimer` trait. `try_lock(key)` (renamed from `try_claim` in v6) returns only a lock (`Box<dyn ClaimLock>`); the `Vault` builds the `Claim` from store + key + lock, so claimers outside the crate can be written and never see the store. `Vault::new(store, claimer)`. Resolves P28; supersedes D25, D30. | §2, §6 |
-| D33 | Async-first, runtime-agnostic | No runtime dependency; I/O uses the `futures` traits. **Async trait methods** (`Store::*`, `Claimer::try_lock`) return `futures::future::BoxFuture` (the traits must be usable as `dyn` and promise `Send`). **Async inherent methods** (`Vault::claim`, `Vault::shutdown`, `Claim::list`/`delete`/`open_read`/`open_write`) are `async fn`, which also makes their checks run when polled rather than when called. Release is synchronous (D39). Supersedes D3 and the v2 async plan. | §2, §7, §11 |
+| D33 | Async-first, runtime-agnostic | `lib-vault` has no runtime dependency and exposes only `futures` traits and types, so a `lib-vault-xxx` backend can target any async runtime. Each backend chooses its runtime and documents it: `lib-vault-memory` needs none, `lib-vault-posix` requires the app to run on tokio (D56). **Async trait methods** (`Store::*`, `Claimer::try_lock`) return the mode's future type (`M::Fut`, D58) or `BoxFuture` (the traits must be usable as `dyn`). **Async inherent methods** (`Vault::claim`, `Vault::shutdown`, `Claim::list`/`delete`/`open_read`/`open_write`) are `async fn`, which also makes their checks run when polled rather than when called. Release is synchronous (D39). Which runtimes fit the remaining `Send` bounds: P50. Supersedes D3 and the v2 async plan. | §2, §7, §11 |
 | D34 | `Key` type | Object names are `Key`, an `Arc<str>` newtype in unix path syntax (`a/b/c`), not `Path`. **Strict canonical form**: not empty, no leading/trailing `/`, no `//`, no `.`/`..`, no NUL, plus the name policy and caps (D6). One string has exactly one valid spelling. There is no root key (D48). Cheap to clone. | §3 |
-| D35 | `Key::join` | Always nests: unlike `Path::join`, the argument can never replace the base. This is what makes scoping a confinement mechanism. Returns `Result<Key, KeyError>`: it fails only with `TooDeep`/`TooLong` when the joined key exceeds the caps (D6), so every `Key`, including a claim's resolved full keys, obeys them. `ScopedStore::resolve` and the `Claim` methods propagate it as `Error::Key`. | §3, §4.1 |
+| D35 | `Key::join` | Always nests: unlike `Path::join`, the argument can never replace the base. This is what makes scoping a confinement mechanism. Returns `Result<Key, KeyError>`: it fails only with `TooDeep`/`TooLong` when the joined key exceeds the caps (D6), so every `Key`, including a claim's resolved full keys, obeys them. The `Claim` methods propagate it as `Error::Key`. | §3, §4.1 |
 | D6 | Name policy | Applies to **every key and every backend**, enforced by `Key::validate`. Each component uses only `[A-Za-z0-9._ -]`, doesn't start with `-`/space or end with `.`/space, isn't a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`9`, `LPT0`–`9`, with any extension, any case) and doesn't start with `.vault` (any case). Caps: component ≤ `MAX_COMPONENT_LEN` = 255 bytes, ≤ `MAX_DEPTH` = 32 components, ≤ `MAX_KEY_LEN` = 1024 bytes. New `KeyError` variants: `InvalidChar`, `BadComponentStart`, `BadComponentEnd`, `Reserved`, `ComponentTooLong`, `TooDeep`, `TooLong`. The case-collision rule needs stored state, so it's a `Store` contract requirement for every backend (`open_write` must fail when the key differs from an existing one only by ASCII case). Resolves P38. | §3, §5, §10 |
-| D36 | Scoping | `Claim::new` wraps the vault's store in `ScopedStore::new(key, store)`, so every key a claim receives is relative to the claimed key and can't leave it. Resolves P27. | §4.1 |
+| D36 | Scoping | A `Claim` keeps its claimed key (`base`) and the unscoped `Arc<dyn Store<M>>`; each method resolves its argument with a private `resolve_key(base, key)` (`None` → `base`, `Some(k)` → `base.join(k)`) and calls the store with the full key. Every key a claim receives is relative to the claimed key and can't leave it. The separate `ScopedStore` type was removed (replaced by that function call). Resolves P27. | §4.1 |
 | D37 | Claim thread model | `Claim` is `Send` (inferred: no `unsafe impl`, no `negative-impl` dependency). Exclusive use comes from every operation taking **`&mut self`**, and `&mut Claim` is `Send`, so tasks using a claim stay spawnable. `Claim` happens to be `!Sync` (`dyn ClaimLock` isn't `Sync`), but nothing depends on it: a `&Claim` can do nothing. Never `Clone`. Supersedes D27; resolves P18, P32, P33. | §4.2 |
-| D38 | Claim operations | `list`, `delete`, `open_read` (→ `ObjectReader<'a>`), `open_write` (→ `ObjectWriter<'a>`) on keys within the claim. Separate read and write handles, because random-access read/write/seek doesn't map onto object stores. Handles are `pub type ObjectReader<'a> = Pin<Box<dyn AsyncRead + Send + 'a>>` (and the writer equivalent): pinned so the `futures` extension methods work for any backend reader, `Send` so tasks stay spawnable. Resolves P30. Replaces `sub_claim`, `open`/`open_dir`, `Dir`, `StoreObject` (D7, D9, D10, D21, D22). | §4.3, §5 |
+| D38 | Claim operations | `list`, `delete`, `open_read` (→ `M::Reader<'a>`), `open_write` (→ `M::Writer<'a>`) on keys within the claim. Separate read and write handles, because random-access read/write/seek doesn't map onto object stores. The handle types depend on the I/O mode (D58). Resolves P30. Replaces `sub_claim`, `open`/`open_dir`, `Dir`, `StoreObject` (D7, D9, D10, D21, D22). | §4.3, §5 |
 | D39 | `ClaimLock` release | A claimer's lock has one method, `release(self: Box<Self>) -> Result<()>`: **synchronous and non-blocking**. Each implementation handles its own async work (its own thread or runtime); the library never runs a future in `release` or `Drop`. **`Ok` means the lock is released**, so the same key can be claimed again immediately. Called from `Claim::release` or `Claim::drop`. Supersedes the v6–v8 async `release` run with `block_on` in `Drop`. Resolves P44, P46, P47. | §4.4, §6 |
 | D40 | `list` result | `Vec<Key>`, relative to the listed key; "prefix" means component prefix. `claim.list(None)` lists everything in the claim (D48). Resolves P31. | §5 |
 | D11 | Giving up a claim | `Claim::release(self) -> Result<()>` consumes the claim, releases the lock and returns any error. Dropping a claim releases the lock if `release` wasn't called and logs errors with `tracing`. Both go through a private `release_lock`; the lock is an `Option<Box<dyn ClaimLock>>` that is `take()`n, so it's released at most once, and a lock-less claim (failed or cancelled `try_lock`, D47) skips it. Because `release` consumes the claim, no claim outlives its lock, and the outstanding count drops as soon as `release` returns. A failed release can't be retried. Resolves P48, P49. | §4.4 |
 | D41 | Shutdown state | One `Arc<Mutex<VaultState { shutting_down, outstanding_claims, waiters: Vec<Waker> }>>` shared by every `Vault` clone and every `Claim` replaces the `AtomicBool` gate, so the flag and the count can't be observed out of step. `claim` checks the flag and counts up under the mutex, then drops the guard **before** awaiting `try_lock` (so its future is `Send` and can't block other threads on the mutex); counting up first makes shutdown wait for in-flight claims. `Claim::drop` releases the lock if still held, counts down, and wakes the waiters, after unlocking, when the count reaches zero. `shutdown` sets the flag and awaits a `poll_fn` that is `Ready` at zero and otherwise registers its waker (deduplicated with `will_wake`). Resolves P35, P42, P43. | §4.5 |
 | D47 | In-flight claim accounting | `Vault::claim` builds the `Claim` (lock-less) under the mutex right after counting up, awaits `try_lock`, then `set_lock`s it. If `try_lock` fails or the `claim` future is dropped, the lock-less `Claim` is dropped and its `Drop` counts down, so refused and cancelled claims never leak a count. Resolves P45. | §4.5 |
-| D48 | No root key | The empty string is not a valid `Key` (`KeyError::Empty`); `Key::root`/`is_root` are gone, so the whole vault can't be claimed. A claim refers to its own key with `None`: `Claim::list`, `delete`, `open_read` and `open_write` take `key: impl AsKeyRef`, implemented for `&str` (validated with `Key::new`; invalid → `Error::Key`), `&Key` and `Option<&Key>`, where `None` means the claimed key itself. No impl for owned `Key` (pass `&key`), and a single `Option` impl so a bare `None` infers. `Store` still takes `&Key`, so backends always receive a full, non-empty key; `Claim` resolves `None`/`Some` via `ScopedStore::resolve`. Consequences: `join` always nests (`a` + `b` = `a/b`); `strip_prefix` of a key by itself is `None`; `parent` of a single-component key is `None`. Resolves P6. | §3, §4.1 |
+| D48 | No root key | The empty string is not a valid `Key` (`KeyError::Empty`); `Key::root`/`is_root` are gone, so the whole vault can't be claimed. A claim refers to its own key with `None`: `Claim::list`, `delete`, `open_read` and `open_write` take `key: impl AsKeyRef`, implemented for `&str` (validated with `Key::new`; invalid → `Error::Key`), `&Key` and `Option<&Key>`, where `None` means the claimed key itself. No impl for owned `Key` (pass `&key`), and a single `Option` impl so a bare `None` infers. `Store` still takes `&Key`, so backends always receive a full, non-empty key; `Claim` resolves `None`/`Some` itself (D36). Consequences: `join` always nests (`a` + `b` = `a/b`); `strip_prefix` of a key by itself is `None`; `parent` of a single-component key is `None`. Resolves P6. | §3, §4.1 |
 | D49 | Workspace layout | A Cargo workspace: `lib-vault` (the core API, all existing code), `lib-vault-posix` (the filesystem backend, D16–D19, D24, D28, D29) and `lib-vault-memory` (the in-memory backend and test double). Backends are separate crates so the core doesn't pull in platform or syscall dependencies. Both backend crates are empty for now. | §12 |
 | D50 | Shared dependencies and metadata | Package `version` and `edition` are declared once in `[workspace.package]` and inherited with `version.workspace = true` / `edition.workspace = true`, so the crates are versioned and built together. Third-party dependencies are declared once, in the root `Cargo.toml` under `[workspace.dependencies]` (version, `default-features` and features), and member crates opt in with `<name>.workspace = true`. Every crate then uses the same version and feature set, and an upgrade is a one-line change. A member may add features on top (`features = [...]`) but can't turn the workspace's default features back off, so defaults are decided at the workspace level. | §12 |
-| D51 | In-memory backend | `lib-vault-memory` provides `MemoryStore`, `MemoryClaimer` and `vault()` for tests and getting started; not for production. Store: objects in a shared `BTreeMap` (clones share it); reads are snapshots; writes are buffered and **committed on `close()`** (a writer dropped without `close()` is discarded); case collisions fail with `MemoryError::CaseCollision` at `open_write` and again at commit; an object at `a` may coexist with `a/b`. Claimer: a shared set of held keys (clones share it), so exclusion covers `Vault`s sharing a claimer but not separate claimers or other processes; works with any store. Its integration tests (`lib-vault-memory/tests/`) cover the core API's documented behavior: scoping, object semantics, the name policy and caps, claim conflicts, release and shutdown. | §12 |
+| D51 | In-memory backend | `lib-vault-memory` provides `MemoryStore` (implementing `Store<SharedMode>`), `MemoryClaimer` and `vault()` (a `Vault<SharedMode>`) for tests and getting started; not for production. Store: objects in a shared `BTreeMap` (clones share it); reads are snapshots; writes are buffered and **committed on `close()`** (a writer dropped without `close()` is discarded); case collisions fail with `MemoryError::CaseCollision` at `open_write` and again at commit; an object at `a` may coexist with `a/b`. Claimer: a shared set of held keys (clones share it), so exclusion covers `Vault`s sharing a claimer but not separate claimers or other processes; works with any store. Its integration tests (`lib-vault-memory/tests/`) cover the core API's documented behavior: scoping, object semantics, the name policy and caps, claim conflicts, release and shutdown. | §12 |
+| D58 | I/O modes | The object-handle style is a type parameter, not a Cargo feature (mutually exclusive features conflict when Cargo unifies them across a dependency graph). `lib_vault::rt` defines a sealed `IoMode` trait with associated `Reader<'a>`, `Writer<'a>` and `Fut<'a, T>` types, and two modes: **`SharedMode`** (borrowed buffers: `Pin<Box<dyn AsyncRead/AsyncWrite + Send>>`, for poll-based runtimes such as tokio, async-std, smol) and **`OwnedMode`** (owned buffers: a `BoxStream` of `Bytes` chunks to read, an `ObjectWrite` with `write(Bytes)`/`close()` to write, for completion-based runtimes such as monoio and io_uring). `Store<M>`, `Vault<M>` and `Claim<M>` are generic over the mode; `Arc<dyn Store<M>>` stays dyn-compatible because the mode is a trait parameter, with the generic associated types on `IoMode` rather than on `Store`. `Claimer`/`ClaimLock` aren't mode-specific. Backends implement `Store<M>` for the modes they support. `Vault<M>` implements `Clone` by hand (deriving would require `M: Clone`). Both modes keep `Send` futures (`BoxFuture`), so `Claim<M>` and `Vault<M>` stay `Send` (D37); `!Send` runtimes are P50. Supersedes the single `ObjectReader`/`ObjectWriter` pair of D38. | §4.3, §5, §7 |
 | D42 | Handle lifetimes | `open_read`/`open_write` take `&'a mut self` and return handles borrowing `'a`, so a claim can't be released or dropped while a handle is alive (compile error E0505), and a claim has at most one open handle at a time, with no `list`/`delete` meanwhile. Accepted. Resolves P29. | §4.3 |
 | D43 | Object semantics | `delete` of a missing key succeeds (like HTTP `DELETE`); `open_read` of a missing key is an error; `open_write` creates or overwrites. When written data is committed/flushed, and what happens to in-flight writes after release, is documented by each `Store`. `list` has no paging or limits in the first revision. | §5 |
 | D44 | Claim conflicts | Documented on `Claimer`: a claim covers its key and everything beneath it (component-wise, `Key::starts_with`); conflicts go both ways (descendants *and* ancestors); disjoint keys don't conflict; exclusion holds across tasks, `Vault`s and processes. `try_lock` **never waits**: one attempt, an error on conflict; callers retry with their own backoff/timeout. Dropping the future releases anything partially acquired. Resolves P36, P40; makes P19 moot. | §6 |
@@ -52,9 +53,15 @@ These were core decisions when the vault was filesystem-only. They now describe 
 | D18 | Non-blocking acquisition | Each `try_lock` is one pass of `try_lock_shared`/`try_lock`; on `WouldBlock` it releases what it took and fails. Never blocks in `flock(2)`. Waiting is the caller's retry loop (D44). | §8.3 |
 | D19 | Claimed files | No atomic rename-replace of a claimed file (it would split the lock); write in place. | §8.3 |
 | D23 | Timeouts | No built-in claim timeout or wait. Callers that retry `claim()` bound the loop with their own timeout. | §6 |
-| D24 | Platforms | **Linux and macOS** first; BSD and Windows later. macOS resolves per component with `openat(O_NOFOLLOW)` plus `O_NOFOLLOW_ANY` for leaf opens; Linux uses `openat2` with a per-component fallback. | §8.1 |
-| D28 | Above-root ancestor locks | Best-effort shared locks on ancestors above the root, per claim. Measure cost with a future performance harness. | §8.3 |
+| D24 | Platforms | **Linux and macOS** first; BSD and Windows later. Linux ≥ 5.6 uses `openat2` for resolution (D53); macOS 15+ resolves per component with `openat(O_NOFOLLOW)` plus `O_NOFOLLOW_ANY` for leaf opens (D54). | §8.1 |
+| D28 | Above-root ancestor locks | Best-effort shared locks on ancestors above the root, per claim. Measure cost with the performance harness (D57). | §8.3 |
 | D29 | What release does (fs) | Release every lock (target, then ancestors bottom-up), close fds, update the in-process registry. **No implicit `sync_all`.** For `flock` this is just closing fds: synchronous, non-blocking, and done when `release` returns. | §4.4 |
+| D52 | Syscall crate | `rustix` for `openat2`/`openat`/`fstatat`/`unlinkat`/`renameat`/`statfs`: safe wrappers over the raw calls with no libc-level `unsafe` in our code, at the cost of one dependency. Resolves P12. | §8.1 |
+| D53 | Minimum Linux kernel | **5.6**, so `openat2` (with `RESOLVE_BENEATH`/`RESOLVE_NO_SYMLINKS`/`RESOLVE_NO_MAGICLINKS`/`RESOLVE_NO_XDEV`) is always available for resolution; there is no per-component `openat` fallback for resolution on Linux. (Locking still walks per component, §8.3.) Resolves P13. | §8.1 |
+| D54 | Minimum macOS | **macOS 15 (Darwin 24)**, the oldest release Apple still supports as of October 2026. No runtime version check: the backend targets the APIs available in macOS 15 and documents the minimum. `O_NOFOLLOW_ANY` (macOS 11+) is therefore always available. Resolves P25. | §8.1 |
+| D55 | MSRV | **Rust 1.89**, the first release with `File::lock`/`try_lock`/`lock_shared` (used for `flock`, §8.3). Resolves P14. | §8.3 |
+| D56 | Runtime for the fs backend | `lib-vault-posix` depends on **tokio** and **requires the app to run on a tokio runtime**: it uses the ambient runtime (e.g. `spawn_blocking` for its blocking syscalls) and doesn't own one. This is the app's choice when it picks the posix backend, and the crate documents it prominently; its futures panic if polled outside a tokio runtime. tokio is not a dependency of `lib-vault` or `lib-vault-memory` (Cargo dependencies are per crate), so apps using another backend can use any runtime. `ClaimLock::release` is synchronous (D39) and must not need the runtime, since it may run from `Drop` on any thread. Resolves P39. | §8.1, §11 |
+| D57 | Performance harness | `criterion` benchmarks in `lib-vault-posix/benches/` for the D28 measurements (per-claim fd and syscall counts, acquisition latency vs depth and contention). Resolves P26. | §12, §13 |
 
 ### Superseded
 | # | Was | Superseded by |
@@ -76,6 +83,8 @@ These were core decisions when the vault was filesystem-only. They now describe 
 | v6–v8 async `ClaimLock::release` | `BoxFuture` release; `Drop` ran it with `futures::executor::block_on` (panicked inside a `futures` executor) | D39 (synchronous, non-blocking release) |
 | v5–v8 `Claim::release` | `async fn release(self)` that consumed the claim and awaited the lock's release | D11 (sync `release(self)`) |
 | v4–v9 `type Error = Box<dyn Error (+ Send + Sync)>` | Placeholder error alias | D12 (`thiserror` enum) |
+| v9 `ScopedStore` | A `Store` wrapper that prefixed keys with the claim's base | D36 (private `resolve_key` in `Claim`) |
+| v9 `ObjectReader`/`ObjectWriter` (single `AsyncRead`/`AsyncWrite` pair) | One handle style for every backend | D58 (`SharedMode` / `OwnedMode`) |
 | v5 `shutting_down: Arc<AtomicBool>` | Shutdown gate as an atomic, re-checked after the lock was granted | D41 (one mutex over flag + count) |
 
 ## Decisions still needed
@@ -83,8 +92,10 @@ These were core decisions when the vault was filesystem-only. They now describe 
 ### API
 | # | Question | Recommendation |
 |---|---|---|
+| P50 | Which async runtimes can a backend target? `OwnedMode` (D58) solves buffer ownership for completion-based I/O, but both modes still require `Send` futures (`BoxFuture`), `Send` handles in `SharedMode`, and `Store`/`Claimer`/`ClaimLock` are `Send`/`Sync`. Work-stealing runtimes (tokio, async-std, smol) fit; **thread-per-core runtimes with `!Send` I/O types (glommio, monoio, tokio-uring)** can't implement the traits directly. | Accept for now: such backends forward work over a channel to a runtime thread. If a real backend needs it, add a third mode with `LocalBoxFuture`/`LocalBoxStream` and drop the `Send`/`Sync` supertraits from `Store` (moving them to the pointer type, e.g. `Arc<dyn Store<M> + Send + Sync>` vs `Rc<dyn Store<Local>>`); a `Claim` in that mode would be `!Send` (D37). |
+| P51 | `OwnedMode`'s `ObjectWrite` has no `Send` bound, but its futures are `BoxFuture` (`Send`). Verified with a scratch implementation: a `Store<OwnedMode>` returning a writer from `future::ready(..)` fails to compile ("`dyn ObjectWrite` cannot be sent between threads safely"); adding `ObjectWrite: Send` fixes it. The `ObjectWrite::write`/`close` futures are `Send` too, so the trait is inconsistent as written. | Make `ObjectWrite: Send` while `OwnedMode` uses `Send` futures (consistent with D37 and D58); revisit with P50 if a `!Send` mode is added. Also add `Send` bounds on `IoMode::Reader`/`Writer` if generic code ever needs to build `M::Fut` values. |
 
-Known leftovers in the final sketch (not decisions): a stale `REVIEW(nit)` comment above the
+Known leftovers in the sketch (not decisions): a stale `REVIEW(nit)` comment above the
 `try_lock` docs (the dead link and unused `executor` feature it mentions are both fixed), and
 doc-comment typos. The `ClaimLock` docs don't say that `release` may run on any thread, outside
 any runtime, and must not block or panic (`design.md` §4.4).
@@ -97,24 +108,18 @@ any runtime, and must not block or panic (`design.md` §4.4).
 | P9 | Ancestor-lock strictness above the root when an ancestor can't be opened | skip silently / warn / hard error / configurable |
 | P10 | ACL support | POSIX ACLs in scope or not |
 | P11 | Optional hardening | dangerous-name denylist, HMAC tamper detection, audit log |
-| P12 | Syscall crate | `rustix` (recommended) vs raw FFI vs `cap-std` |
 | P20 | Case-collision check race: the `Store` case rule (D6) applies to every backend; in the fs backend the check runs under only a shared parent lock, so concurrent `Foo`/`foo` creates can both pass | accept and document vs exclusive parent lock for creates (each backend documents its approach) |
 | P21 | Crash safety for in-place writes (D19) | recommend directory claims + atomic write helper |
 | P22 | Safety of the root's parent directories | sshd StrictModes-style check vs root only |
 | P23 | Verify-after-lock retry limit | count and error |
 | P24 | Read-only fallback for file claims | keep vs fail with `PermissionDenied` |
-| P13 | Minimum Linux kernel | require `openat2` (5.6+) vs keep fallback |
-| P14 | MSRV | ≥ 1.89 (`File::lock`) |
-| P25 | macOS minimum | 11+ (`O_NOFOLLOW_ANY`) vs per-component only |
-| P26 | Performance harness (D28) | `criterion` vs custom bench |
 | P16 | Network filesystems | refuse vs warn |
-| P39 | How async methods run blocking syscalls without a runtime dependency (D33) | a small internal thread pool vs requiring a caller-provided spawner |
 
 ### Closed
 | # | Resolution |
 |---|---|
 | P29 | Handles borrow the claim (D42). |
-| P30 | `Pin<Box<dyn AsyncRead/AsyncWrite + Send + 'a>>` aliases (D38). |
+| P30 | Handle types per I/O mode: `AsyncRead`/`AsyncWrite` in `SharedMode`, owned `Bytes` chunks in `OwnedMode` (D38, D58). |
 | P35 | One mutex over flag, count and waiters (D41). |
 | P45 | A lock-less `Claim` is built before `try_lock`, so its `Drop` gives the count back on error or cancellation (D47). |
 | P42 | `claim` drops the `MutexGuard` before awaiting `try_lock`; its future is `Send` (D41). |
@@ -131,7 +136,7 @@ any runtime, and must not block or panic (`design.md` §4.4).
 | P46 | Same: nothing is run on an executor in `Drop`, so it can't nest (D39). |
 | P2 | Shutdown waits for claims only (D46). |
 | P19 | Moot: the library never waits on a claim (D44). Callers that retry should back off. |
-| P27 | Claims are scoped via `ScopedStore` (D36). |
+| P27 | Claims are scoped by resolving every key against the claimed key (D36). |
 | P28 | Claimer returns a `ClaimLock`; Vault builds the Claim (D32). |
 | P31 | `list` returns `Vec<Key>` (D40). |
 | P32 | `unsafe impl Send` and `negative-impl` removed (D37). |
@@ -141,23 +146,30 @@ any runtime, and must not block or panic (`design.md` §4.4).
 | P6 | There is no root key; a claim names itself with `None` (D48). |
 | P7 | `claim.delete(None)` deletes the claimed object itself (D48). Fs semantics in §8.3. |
 | P3 | Moot: no `Dir` (D38). |
+| P12 | `rustix` (D52). |
+| P13 | Linux 5.6+, `openat2` required (D53). |
+| P14 | MSRV 1.89 (D55). |
+| P25 | macOS 15 / Darwin 24, no runtime check (D54). |
+| P26 | `criterion` (D57). |
+| P39 | `lib-vault-posix` requires the app's tokio runtime, documented; tokio stays out of the other crates (D56). |
 | P15 | Windows after v1 (D24). |
 | P17 | Moot: sharing mode is an `FsStore` constructor concern (D32). |
 | P18 | Moot: nothing depends on `Claim` being `!Sync` (D37). |
 | V2-1…V2-8 | The v2 async plan is replaced by async-first (D33). Still-relevant hazards are carried in §11. |
 
-## Alignment of `lib-vault/src/` (final sketch, v9) with decisions
+## Alignment of `lib-vault/src/` (sketch v10) with decisions
 
 | Item | Status in `lib-vault/src/` |
 |---|---|
-| Build | ✅ Workspace builds; `lib-vault`'s 19 unit tests pass; clippy and `cargo doc` are clean; the `Claim::list` example is `ignore`d. |
+| Build | ✅ Workspace builds; 60 workspace tests pass (17 `lib-vault` unit tests); clippy and `cargo doc` are clean; the `Claim::list` example is `ignore`d. |
 | D6, D34, D35, D48 `Key` | ✅ Name policy, caps and fallible `join` implemented with unit tests; empty keys rejected. `Store::open_write` documents the case-collision rule. |
-| D36 scoping | ✅ `Claim::new` wraps the store in `ScopedStore`. |
-| D37 thread model | ✅ `&mut self` methods; compile-time `Claim: Send` test. No `Send` assertion for the `claim()`/`shutdown()` futures (they are `Send`, checked with a probe against v8). |
-| D38, D42 handles | ✅ Public pinned, `Send`, claim-borrowing aliases. |
+| D36 scoping | ✅ `Claim` resolves keys with `resolve_key`; `ScopedStore` removed. |
+| D37 thread model | ✅ `&mut self` methods; compile-time test that `Claim<M>` is `Send`, `Vault<M>` is `Send + Sync + Clone`, and the `claim()`/`shutdown()` futures are `Send`, for both modes. |
+| D38, D42, D58 handles and I/O modes | ✅ `rt::{IoMode, SharedMode, OwnedMode}`; `Store<M>`, `Vault<M>`, `Claim<M>` generic; handles borrow the claim. ⚠ `ObjectWrite` isn't `Send`, so `Store<OwnedMode>` can't easily be implemented (P51). No backend implements `OwnedMode` yet. |
 | D43 object semantics | ✅ Documented on `Claim` and on `Store`. |
 | D39, D11 release | ✅ Sync `ClaimLock::release` with a documented `Ok` contract; `Claim::release(self)` consumes the claim and returns errors; `Drop` releases if needed and logs errors. |
 | D44, D45 `Claimer` | ✅ Documented. |
 | D48 optional keys | ✅ `Claim::list/delete/open_read/open_write` take `impl AsKeyRef` (`&str`, `&Key`, `Option<&Key>`); `Store` takes `&Key`. |
 | D41, D46, D47 shutdown | ✅ Guard dropped before `.await`; refused/cancelled claims give their count back; `Drop` counts down and wakes waiters; shutting down returns `Error::ShuttingDown`. |
 | D12 errors | ✅ `thiserror` enum. |
+| D51 memory backend | ✅ `Store<SharedMode>` only. |
