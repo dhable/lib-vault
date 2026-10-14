@@ -251,7 +251,9 @@ Every key a `Store` receives is a full key that already satisfies the name polic
 
 **Case collisions** (D6): `open_write` must fail if the key differs only by ASCII case from an
 existing object's key, so `Foo` and `foo` never coexist. This is the one name rule that needs
-stored state, so every backend enforces it rather than `Key`. Doing it race-free is P20.
+stored state, so every backend enforces it rather than `Key`. It's race-free within one claim;
+to create objects whose names might collide, claim their parent directory. Two concurrent claims
+on sibling keys that differ only by case can both pass the check (D65).
 
 Object semantics (D43):
 - **`list`** (D40): everything beneath `key`, as keys relative to `key`; "beneath" is
@@ -290,7 +292,7 @@ These are documented on the traits in `lib-vault/src/claimer.rs`:
   acquired is released; a lock is never held without a returned `ClaimLock`.
 - **Errors**: conflict, or the backend refusing or being unreachable.
 - **Pairing with a store** (D45, resolves P37): some claimers lock the store's own storage
-  (`FlockClaimer` locks `FsStore`'s directories). Each claimer documents which stores it works
+  (`FsClaimer` locks `FsStore`'s directories). Each claimer documents which stores it works
   with; `Vault::new` doesn't check.
 - **`ClaimLock::release`** is synchronous and non-blocking; the implementation handles any
   async work itself. It returns `Ok` only once the key can be claimed again immediately (D39,
@@ -377,7 +379,7 @@ and now consumes the claim (`release(self)`), as the v5–v8 `async fn release(s
 Since v3: `Vault::new(root)` / `new_shared`, `shutdown_timeout`, `Claim<'a>` lifetimes,
 `sub_claim`, `open() -> &File`, `open_dir() -> &Dir`, `Dir`.
 
-## 8. Filesystem backend (`FsStore` + `FlockClaimer`)
+## 8. Filesystem backend (`FsStore` + `FsClaimer`)
 
 The first backend. This was the whole design before v4; it now describes one `Store` and one
 `Claimer` that must be used together (D45).
@@ -419,7 +421,7 @@ These are blocking syscalls behind an async API. How they run without depending 
 Windows (later): reject reparse points (symlinks, junctions, mount points), alternate data streams
 (`name:stream`) and 8.3 short names.
 
-### 8.3 `FlockClaimer`: cross-process exclusion (D16)
+### 8.3 `FsClaimer`: cross-process exclusion (D16)
 
 **Mechanism.** Options considered for coordinating unrelated processes running as different uids:
 
@@ -439,30 +441,37 @@ open the object. std exposes it: `File::open` works on Unix directories, and
 `File::lock`/`lock_shared`/`try_lock`/`try_lock_shared`/`unlock` (Rust 1.89+) map to `flock`.
 Locks belong to the open file description, so separate opens within one process also exclude each other.
 
-**Protocol "inode-lock v1"** (frozen; every lib-vault version must speak it). To claim
-`T = r/c1/…/cn` (`r` = vault root):
+**Protocol "lock-file v1"** (D16, D67; frozen once implemented: every lib-vault version must speak it). Each key component `ci` is represented by a hidden lock file `.vault-lock-ci` in its parent directory (reserved `.vault` prefix: never a key, never listed). To claim `T = c1/…/cn` under vault root `r`:
 
-1. Walk from the root handle, opening each component no-follow.
-2. In strict top-down order: `lock_shared` on `r` and every ancestor, then `lock` (exclusive) on `T`.
-3. **Verify after lock** at each level: `fstatat(parent_fd, name, AT_SYMLINK_NOFOLLOW)` must match the locked fd's `(st_dev, st_ino)`, and `st_nlink > 0`. On a mismatch (renamed or removed while waiting), unlock that level and retry, with a bounded retry count (P23).
-4. The claim holds n+1 fds (ancestors shared + target exclusive) for its lifetime. Closing them releases the locks.
+1. Walk from the root handle, opening each directory no-follow and **creating missing intermediate directories** (a lock file needs its parent directory). Open, or create, each component's lock file no-follow.
+2. In strict top-down order: `lock_shared` on `.vault-lock-c1` … `.vault-lock-c(n-1)`, then `lock` (exclusive) on `.vault-lock-cn`.
+3. **Verify after lock** at each level: `fstatat(parent_fd, name, AT_SYMLINK_NOFOLLOW)` must match the locked fd's `(st_dev, st_ino)`, and `st_nlink > 0`. On a mismatch (renamed or removed while waiting), unlock that level and retry, up to `max_verify_retries` per level (default 3); when exhausted, the claim fails with `PosixError::VerifyRetriesExhausted` (D66).
+4. The claim holds n lock fds (ancestors shared, target exclusive) for its lifetime. Closing them releases the locks. On release, the target's lock file is unlinked while still held exclusively; ancestor lock files stay (empty, hidden, reused).
 
 Correctness:
-- `a/b/c` vs `a/b/d`: both share only ancestors, so they are compatible.
-- `a/b` vs held `a/b/c`: the exclusive lock on `a/b` is blocked by the holder's shared lock ✔. `a/b/c/d` vs held `a/b/c`: the shared lock on `a/b/c` is blocked by the holder's exclusive lock ✔.
+- `a/b/c` vs `a/b/d`: different target lock files, shared ancestors, so they are compatible.
+- `a/b` vs held `a/b/c`: the exclusive lock on `.vault-lock-b` is blocked by the holder's shared lock on it ✔. `a/b/c/d` vs held `a/b/c`: the shared lock on `.vault-lock-c` is blocked by the holder's exclusive lock ✔.
 - Fixed top-down order prevents deadlock between claimants.
-- **Aliasing is solved for free**: `Notes` and `notes` on a case-insensitive filesystem are the same inode, so they get the same lock. Hard links are refused. A rename by an outsider moves the lock with the inode.
+- **Aliasing**: on a case-insensitive filesystem `.vault-lock-Notes` and `.vault-lock-notes` are the same file, so they get the same lock. Hard links are refused. If an outsider renames or deletes a lock file, verify-after-lock (step 3) catches it and the claimant retries.
 
 Rules and consequences:
-- **The target must exist** before it can be locked, so claiming a missing key must create it. As a file or a directory is open (P1, P8).
-- **Deleting a claimed target** happens via the held parent fd. Waiters then wake on a dead inode, fail verify and retry.
-- **Read permission is required**: opening a directory for `flock` needs `r`, so every participant needs `r-x` along its claim paths. Otherwise the claim fails with `PermissionDenied`.
-- **Nested vault roots** (app A at `/data/v`, app B at `/data/v/sub`): also take **best-effort shared locks on every ancestor above the vault root up to `/`** (D28). Unopenable ancestors are skipped, with a `tracing` warning (P9). `/` and system directories are refused as roots.
+- **Create on write** (D67): the claim locks the key's lock file, so the object doesn't need to exist. It's created by the first `open_write`; claiming and releasing a missing key leaves no object (only intermediate directories, which aren't objects). **File claims** are allowed: the exclusive lock is on that key's lock file only, not its parent directory (D59).
+- **Deleting a claimed object** happens via the held parent fd and doesn't touch the lock file, so the claim stays held.
+- **Permissions**: every participant needs `rwx` on the directories along its claim paths (to create lock files and directories) and read access to the lock files. Otherwise the claim fails with `PermissionDenied`.
+- **Nested vault roots are not allowed** (D72): a vault root must not sit inside another vault's tree, or contain one. This is documented, not detected; if two vaults do nest, exclusion between them isn't guaranteed. No locks are taken above the root. `/` and system directories are refused as roots.
 - **In-process registry**: keyed by `(dev, ino)`, it gives fast conflict errors for claims held in this process. `flock` stays the source of truth.
 - **Acquisition** (D18, D44): each `try_lock` is one non-blocking pass: `try_lock_shared`/`try_lock` at every level, and on `WouldBlock` release everything taken and fail with a conflict. It never parks a thread in blocking `flock(2)`. Callers that want to wait retry with backoff (about 1 ms → 50 ms with jitter) and their own timeout.
 - **Fairness**: `flock` has no queueing, so waiters can starve.
-- **Filesystems**: local only, since NFS `flock` emulation and directory locking are unreliable. Detect with `statfs`: `f_type` magic numbers on Linux, `MNT_LOCAL` on macOS (P16).
-- **File claims** (D19): no atomic rename-replace of a claimed file. Temp-file + rename creates a new inode: the holder keeps locking the orphaned old one while a waiter locks the new one, and both believe they hold the claim. Write in place. Open `O_RDWR`, falling back to `O_RDONLY` when a cross-uid participant has only read permission (P24).
+- **Filesystems** (D69): local filesystems are expected, since NFS `flock` emulation is unreliable across hosts. Construction detects others with `statfs` (`f_type` magic numbers on Linux, `MNT_LOCAL` on macOS), logs a `tracing` warning and continues.
+- **Writes and crash safety** (D19, D63): objects are written **in place**, so the inode never changes and the claim's `flock` stays on the right file. An optional journal, **on by default** and chosen when the `FsStore` is created, makes writes crash-safe:
+  1. `open_write` creates `.vault-journal-<name>` beside the object (reserved `.vault` prefix: never a key, never listed). Its header holds a magic number, the content length and a checksum, plus a completion marker.
+  2. `write` appends only to the journal; the object is untouched.
+  3. `close()` completes the header, fsyncs the journal and the directory (`F_FULLFSYNC` on macOS), truncates and rewrites the object in place, fsyncs it, unlinks the journal and fsyncs the directory. The commit point is `close()`.
+  4. A writer dropped without `close()` never touched the object; its journal is deleted (best effort).
+
+  With journaling off, writes truncate, write in place and fsync, and a crash can leave a partial object. Journaling costs about 2× the bytes written.
+- **Leftover journal** (D63): in either mode, `open_read`/`open_write` on a key whose journal exists fail with `Error::StoreError` wrapping a posix `InterruptedWrite { key, journal }` error that names the file. Only that object is affected, and `list`/`delete` work normally. The check happens at open time; there's no scan when the store is created. Recovery is manual: copy a complete journal (valid checksum) over the object, or delete an incomplete one. The library offers no replay API.
+- **No read-only fallback** (D61): if the object can't be opened read-write (for example a different uid with read-only permission), `open_write` fails with a permission error (`StoreError` wrapping `PermissionDenied`), not `AlreadyClaimed`. Because claims lock lock files (D67), this surfaces when the object is opened, not when it's claimed.
 - **Windows (later)**: `LockFileEx` can't lock directories. Candidate: directory handles opened with share modes (`FILE_SHARE_READ` = shared, no sharing = exclusive).
 
 ## 9. OS-level security (filesystem backend)
@@ -473,9 +482,26 @@ seccomp) is out of scope (D4).
 Checks when an `FsStore` is created:
 - The root is a real directory (opened no-follow), on a local filesystem, and not `/` or a system directory.
 - Creation is idempotent across apps: `mkdir` tolerating `EEXIST`, then validate. No shared metadata is written.
+- **Always checked** at construction: a root with extended ACLs is refused with `PosixError::ExtendedAcl` (D70); a non-local filesystem is allowed with a `tracing` warning (D69). Ownership and the sharing modes control who can read a vault.
+- **Construction options** (D66): `FsStore::new(root, FsStoreOptions)`. The options use builder methods over `Default`, so new options don't break callers:
+  ```rust
+  pub enum Sharing { Private, Group(u32 /* gid */) }
+
+  impl Default for FsStoreOptions { /* Private, journaling on, strict modes on, 3 retries */ }
+  impl FsStoreOptions {
+      pub fn sharing(self, sharing: Sharing) -> Self;
+      pub fn journaling(self, on: bool) -> Self;        // D63
+      pub fn strict_modes(self, on: bool) -> Self;      // D64
+      pub fn max_verify_retries(self, n: u32) -> Self;  // §8.3 step 3; 0 = fail on first mismatch
+  }
+
+  let store = FsStore::new("/data/vault", FsStoreOptions::default().sharing(Sharing::Group(4242)))?;
+  ```
+  Backend errors are a `#[non_exhaustive] PosixError` (`InterruptedWrite`, `StrictModes`, `VerifyRetriesExhausted`, `ExtendedAcl`, …), reaching callers wrapped in `Error::ClaimError` / `Error::StoreError`.
+- **Strict modes** (D64, when `strict_modes` is on): modeled on sshd's `StrictModes`. Construction walks from the vault root up to `/`, opening each directory no-follow and `fstat`ing the handle. Each ancestor must be owned by root or the effective uid and not writable by group or others, unless it is root-owned with the sticky bit (like `/tmp`). The root itself must match its sharing mode. A violation fails construction with an error naming the directory and the reason. This protects the moment the root is opened: someone able to write an ancestor could swap the path first. With `strict_modes` off, these checks are skipped.
 - **Sharing mode** (formerly D30, now an `FsStore` constructor concern):
   - private: root owned by the euid, mode `0700`, files `0600`;
-  - group: root group-owned by a given gid, setgid `2770`, files `0660`. Different-uid apps need this mode or admin-configured ACLs (P10).
+  - group: root group-owned by a given gid, setgid `2770`, files `0660`. Different-uid apps need this mode. POSIX ACLs are not supported on vault objects (D62), and a root with extended ACLs is refused at construction (D70).
   - A root that doesn't match the requested mode is rejected. Nothing world-writable is ever accepted.
 - Linux: emit a `tracing` warning when `fs.protected_symlinks` / `fs.protected_hardlinks` are disabled.
 
@@ -492,16 +518,16 @@ Deployment guide (documentation):
 - **Name policy (strict portable ASCII, D6)** for every key and every backend, enforced by
   `Key::validate` (§3): `[A-Za-z0-9._ -]` only, no leading `-`/space or trailing `.`/space, no
   Windows device names, no `.vault` prefix, component ≤ 255 bytes, ≤ 32 components, ≤ 1024
-  bytes. The case-collision rule is a `Store` requirement (§5, race: P20). This rules out
+  bytes. The case-collision rule is a `Store` requirement; create under a claim on the parent directory to avoid races (§5, D65). This rules out
   terminal-escape, bidi and homoglyph spoofing when names are shown to humans, and the same key
   is valid in every backend.
 - **Claim DoS by the model**: no acquisition timeouts in the library (D23). The harness wraps
   `claim()` in a timeout and owns hold-time and claim-count policy.
-- **Memory poisoning / persistent prompt injection**: the library can't judge content. Future work: optional provenance and tamper detection (P11).
-- **Dangerous-by-convention names** (`.git`, `.envrc`, `.vscode`, `Makefile`, `*.desktop`…): optional configurable denylist (P11). Never create executables.
-- **Crash consistency**: in-place writes can leave partial files (P21).
+- **Memory poisoning / persistent prompt injection**: the library can't judge content. Optional provenance and tamper detection (HMAC) is deferred to v2 (D68).
+- **Dangerous-by-convention names** (`.git`, `.envrc`, `.vscode`, `Makefile`, `*.desktop`…): optional configurable denylist, deferred to v2 (D68). Never create executables.
+- **Crash consistency**: the filesystem backend journals writes by default, so a crash never leaves a partial object silently; an interrupted write makes that object's opens fail until an operator resolves the journal (D63). Journaling can be turned off when the store is created.
 - **fd hygiene** (fs): `O_CLOEXEC` everywhere. A child process inheriting a lock fd would keep a claim alive.
-- **fd budget** (fs): each claim holds depth+1 fds, plus ancestors above the root. Cap key depth.
+- **fd budget** (fs): each claim holds one lock fd per key component (at most `MAX_DEPTH` = 32).
 
 ## 11. Async notes
 
@@ -531,7 +557,7 @@ root.
 | Crate | Contents |
 |---|---|
 | `lib-vault` | the core API: `Vault`, `Claim`, `Key`, the `Store` / `Claimer` / `ClaimLock` traits, `ScopedStore`, `Error` |
-| `lib-vault-posix` | *(empty)* the filesystem backend: `FsStore`, `FlockClaimer` (§8) |
+| `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<SharedMode>`), `FsClaimer`, `FsStoreOptions`, `Sharing`, `PosixError`, `vault()`; requires a tokio runtime (D56) |
 | `lib-vault-memory` | the in-memory backend for tests and getting started (D51): `MemoryStore`, `MemoryClaimer`, `vault()`; integration tests in `tests/` exercise the core API against it |
 
 Modules in `lib-vault/src/`:
@@ -546,9 +572,9 @@ Modules in `lib-vault/src/`:
 | `store.rs` | `Store`, `ScopedStore`, `ObjectReader` / `ObjectWriter` |
 | `claimer.rs` | `Claimer`, `ClaimLock` |
 
-The planned `lib-vault-posix` layout: `FsStore`, `FlockClaimer`, the case-collision check,
-inode-lock v1, the in-process registry, `sys/{linux,macos}.rs`, and *(future)* `benches/` for
-the performance harness (D28, P26).
+The planned `lib-vault-posix` layout: `FsStore`, `FsClaimer`, the case-collision check,
+lock-file v1 (D67), the in-process registry, `sys/{linux,macos}.rs`, and *(future)* `benches/` for
+the performance harness (D57).
 
 ## 13. Verification strategy
 
@@ -574,6 +600,5 @@ the performance harness (D28, P26).
   - pre-planted symlink, hard link, FIFO and bind mount are refused;
   - multi-process tests (re-exec the test binary): overlapping vs disjoint claims, `kill -9` of the holder releases its locks, a waiter on a removed directory hits verify and retries;
   - cross-uid: a CI job in a root-capable container runs two children under different uids sharing a group-mode vault;
-  - nested vault roots: an outer-root exclusive claim blocks an inner-root claim;
   - CI matrix: Linux (with `openat2` plus a fallback-path run) and macOS.
-- *(future)* Performance harness: per-claim fd and syscall counts, acquisition latency vs key depth and contention (D28).
+- *(future)* Performance harness (D57): per-claim fd and syscall counts, acquisition latency vs key depth and contention.

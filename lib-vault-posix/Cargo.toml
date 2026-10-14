@@ -2,5 +2,18 @@
 name = "lib-vault-posix"
 version.workspace = true
 edition.workspace = true
+rust-version = "1.89"
 
 [dependencies]
+lib-vault.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rustix.workspace = true
+tokio = { workspace = true, features = ["rt", "fs"] }
+tokio-util = { workspace = true, features = ["compat"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process"] }
+futures = { workspace = true, features = ["executor"] }
+tempfile.workspace = true
