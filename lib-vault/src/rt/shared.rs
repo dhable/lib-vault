@@ -1,3 +1,6 @@
+//! Defines a series of I/O types for work stealing runtimes that can run tasks
+//! on a pool of threads scheduled on different cores. `tokio` is notability the
+//! most widely used shared runtime.
 use futures::future::BoxFuture;
 use futures::{AsyncRead, AsyncWrite};
 use std::pin::Pin;

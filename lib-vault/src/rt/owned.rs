@@ -1,3 +1,6 @@
+//! Defines a series of I/O types for runtimes that operate on moving owned buffers
+//! around. These runtimes normally assign a thread to a specific core and threads
+//! do not pull pending work or reassign work to other threads.
 use crate::Error;
 use bytes::Bytes;
 use futures::future::BoxFuture;
