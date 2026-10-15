@@ -2,11 +2,18 @@
 
 use futures::{AsyncReadExt, AsyncWriteExt};
 use lib_vault::{AsKeyRef, Claim, Error, Key, Vault, rt::SharedMode};
-use lib_vault_posix::{FsStore, FsStoreOptions, PosixError};
+use lib_vault_posix::{FsClaimer, FsStore, FsStoreOptions, PosixError};
 use std::path::{Path, PathBuf};
 
 pub type FsVault = Vault<SharedMode>;
 pub type FsClaim = Claim<SharedMode>;
+
+/// A `Vault` over an `FsStore` at `root` with its `FsClaimer`.
+pub fn fs_vault(root: impl AsRef<Path>, options: FsStoreOptions) -> FsVault {
+    let store = FsStore::new(root, options).unwrap();
+    let claimer = FsClaimer::new(&store);
+    Vault::new(store, claimer)
+}
 
 pub fn key(s: &str) -> Key {
     Key::new(s).unwrap()
@@ -27,14 +34,14 @@ impl TempVault {
     pub fn with(options: FsStoreOptions) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("vault");
-        let vault = lib_vault_posix::vault(&root, options).unwrap();
+        let vault = fs_vault(&root, options);
         let root = std::fs::canonicalize(&root).unwrap();
         TempVault { dir, root, vault }
     }
 
     /// A second, independent `Vault` (its own store, claimer and descriptors) on the same root.
     pub fn reopen(&self) -> FsVault {
-        lib_vault_posix::vault(&self.root, FsStoreOptions::default()).unwrap()
+        fs_vault(&self.root, FsStoreOptions::default())
     }
 
     pub async fn claim(&self, k: &str) -> FsClaim {

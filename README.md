@@ -10,7 +10,8 @@ are pluggable backends.
 - **Confinement**: keys can't express `..`, absolute paths or links, so a claim can't reach
   outside its subtree.
 - **Exclusive claims**: a claim on `a/b` blocks `a/b`, `a/b/c` and `a`, but not `a/c`.
-- **Pluggable backends**: implement `Store` (data) and `Claimer` (locking).
+- **Pluggable backends**: a `Store` (data) and a `Claimer` (locking), chosen separately, e.g.
+  a filesystem store with a local or a distributed claimer.
 - **Runtime-agnostic core**: async API, no runtime dependency; each backend states its own.
 - **Crash-safe filesystem backend**: journaled writes, `flock` exclusion across processes,
   hardened against symlink and permission attacks.
@@ -48,15 +49,31 @@ claim.open_read("notes.md").await?.read_to_string(&mut text).await?;
 claim.release()?;
 ```
 
-For persistent storage, swap in `lib_vault_posix::vault("/srv/app/vault", FsStoreOptions::default())?`
-inside a tokio runtime. See each crate's README for details.
+For persistent storage, build the vault from a filesystem store and a claimer of your choice,
+inside a tokio runtime:
+
+```rust
+let store = FsStore::new("/srv/app/vault", FsStoreOptions::default())?;
+let claimer = FsClaimer::new(&store); // or any other `Claimer`
+let vault = Vault::new(store, claimer);
+```
+
+See each crate's README for details.
 
 ## Choosing a backend
 
-| Backend | Persistent | Exclusion scope | Runtime | Platforms |
-|---|---|---|---|---|
-| `lib-vault-memory` | No | One claimer (and its clones) | Any, or none | Any |
-| `lib-vault-posix` | Yes | All processes using the same root | tokio | Linux ≥ 5.6, macOS ≥ 15 |
+A vault is a store plus a claimer, chosen separately. Every process sharing data must use the
+same claimer.
+
+| Store | Persistent | Runtime | Platforms |
+|---|---|---|---|
+| `MemoryStore` (`lib-vault-memory`) | No | Any, or none | Any |
+| `FsStore` (`lib-vault-posix`) | Yes | tokio | Linux ≥ 5.6, macOS ≥ 15 |
+
+| Claimer | Excludes | Works with |
+|---|---|---|
+| `MemoryClaimer` (`lib-vault-memory`) | Vaults in one process sharing the claimer | Any store |
+| `FsClaimer` (`lib-vault-posix`) | Processes on one host sharing the root | `FsStore` only |
 
 ## Documentation
 

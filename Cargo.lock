@@ -149,6 +149,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "lib-vault",
+ "lib-vault-memory",
  "rustix",
  "tempfile",
  "thiserror",

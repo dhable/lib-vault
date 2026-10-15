@@ -1,5 +1,5 @@
 //! A filesystem backend for `lib-vault` on Linux (≥ 5.6) and macOS (≥ 15): an [`FsStore`]
-//! that keeps objects as files under a vault root, and the [`FsClaimer`] that locks them with
+//! that keeps objects as files under a vault root, and an [`FsClaimer`] that locks them with
 //! `flock` across threads and processes.
 //!
 //! **Requires a tokio runtime.** Choosing this backend means the app runs on tokio (D56): its
@@ -8,11 +8,13 @@
 //!
 //! ```no_run
 //! use futures::{AsyncReadExt, AsyncWriteExt};
-//! use lib_vault::Key;
-//! use lib_vault_posix::FsStoreOptions;
+//! use lib_vault::{Key, Vault};
+//! use lib_vault_posix::{FsClaimer, FsStore, FsStoreOptions};
 //!
 //! # #[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let vault = lib_vault_posix::vault("/srv/app/vault", FsStoreOptions::default())?;
+//! let store = FsStore::new("/srv/app/vault", FsStoreOptions::default())?;
+//! let claimer = FsClaimer::new(&store); // or any other `Claimer`
+//! let vault = Vault::new(store, claimer);
 //! let mut claim = vault.claim(Key::new("session")?).await?;
 //!
 //! let mut writer = claim.open_write("notes.md").await?;
@@ -25,6 +27,20 @@
 //! claim.release()?;
 //! # Ok(()) }
 //! ```
+//!
+//! # Claimers
+//!
+//! The store and the claimer are chosen separately (D75). [`FsStore`] works with any
+//! [`Claimer`](lib_vault::Claimer); [`FsClaimer`] works only with an `FsStore`:
+//!
+//! | Claimer | Excludes | Use when |
+//! |---|---|---|
+//! | [`FsClaimer`] | Processes on one host sharing the root (`flock`) | The vault is on a local filesystem |
+//! | A distributed claimer (e.g. ZooKeeper) | Processes on every host that uses it | Hosts share the storage |
+//! | `lib_vault_memory::MemoryClaimer` | Vaults in one process sharing the claimer | Tests |
+//!
+//! Every process using a vault root must use the same kind of claimer: different claimers
+//! don't see each other's claims. This isn't detected.
 //!
 //! See `docs/design.md` §8–§9 for the protocol and checks.
 
@@ -46,16 +62,3 @@ pub use store::FsStore;
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
-
-use lib_vault::{Vault, rt::SharedMode};
-use std::path::Path;
-
-/// A `Vault` over an [`FsStore`] at `root` and its paired [`FsClaimer`].
-pub fn vault(
-    root: impl AsRef<Path>,
-    options: FsStoreOptions,
-) -> Result<Vault<SharedMode>, PosixError> {
-    let store = FsStore::new(root, options)?;
-    let claimer = store.claimer();
-    Ok(Vault::new(store, claimer))
-}

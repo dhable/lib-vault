@@ -1,24 +1,26 @@
 # lib-vault-posix
 
 Filesystem backend for [`lib-vault`](../lib-vault): `FsStore` keeps objects as files under a
-vault root, and `FsClaimer` locks them with `flock` across threads and processes.
+vault root. Pair it with any claimer: `FsClaimer` (included) locks with `flock` across threads
+and processes on one host.
 
 > **Requirements**
 > - **tokio runtime**: operations run on tokio's blocking pool and panic outside a runtime.
 > - **Linux ≥ 5.6 or macOS ≥ 15**, **Rust ≥ 1.89**.
-> - **Local filesystem**: network filesystems are allowed but logged as a warning, since
->   `flock` is unreliable across hosts.
+> - **Local filesystem** with `FsClaimer`: network filesystems are allowed but logged as a
+>   warning, since `flock` is unreliable across hosts.
 
 ## Example
 
 ```rust,no_run
 use futures::{AsyncReadExt, AsyncWriteExt};
-use lib_vault::Key;
-use lib_vault_posix::{FsStoreOptions, Sharing};
+use lib_vault::{Key, Vault};
+use lib_vault_posix::{FsClaimer, FsStore, FsStoreOptions};
 
 # #[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
-let options = FsStoreOptions::default(); // or .sharing(Sharing::Group(gid))
-let vault = lib_vault_posix::vault("/srv/app/vault", options)?;
+let store = FsStore::new("/srv/app/vault", FsStoreOptions::default())?;
+let claimer = FsClaimer::new(&store); // or any other `Claimer`
+let vault = Vault::new(store, claimer);
 let mut claim = vault.claim(Key::new("session")?).await?;
 
 let mut writer = claim.open_write("notes.md").await?;
@@ -32,8 +34,18 @@ claim.release()?;
 # Ok(()) }
 ```
 
-`vault()` is shorthand for `FsStore::new(root, options)` plus `store.claimer()`. Always pair a
-store with its own claimer.
+## Choosing a claimer
+
+`FsStore` works with any `Claimer`; `FsClaimer` works only with an `FsStore`.
+
+| Claimer | Excludes | Use when |
+|---|---|---|
+| `FsClaimer::new(&store)` | Processes on one host sharing the root (`flock`) | The vault is on a local filesystem |
+| A distributed claimer (e.g. ZooKeeper) | Processes on every host that uses it | Hosts share the storage |
+| `lib_vault_memory::MemoryClaimer` | Vaults in one process sharing the claimer | Tests |
+
+**Every process using a root must use the same kind of claimer.** Different claimers don't see
+each other's claims, and this isn't detected.
 
 ## Options
 
@@ -57,7 +69,8 @@ store with its own claimer.
 ```
 
 - Lock and journal files use the reserved `.vault` prefix: never valid keys, never listed.
-- A claim takes shared `flock`s on its ancestors' lock files and an exclusive one on its own.
+- Lock files exist only with `FsClaimer`: a claim takes shared `flock`s on its ancestors' lock
+  files and an exclusive one on its own.
 - Objects are created on the first write; claiming a missing key creates no object.
 - Names too long for a lock or journal file name are hashed (`.vault-lock-#<hash>`).
 
@@ -76,8 +89,9 @@ store with its own claimer.
 If a process dies mid-commit, the journal stays and `open_read`/`open_write` on that key fail
 with `PosixError::InterruptedWrite { key, journal }`. Other keys are unaffected. Fix by hand:
 
-- **Complete journal** (header starts with `LVJRNL01`; its length and CRC-32
-  match the content): the new content follows the 32-byte header. Copy it over the object (`tail -c +33 journal > object`), then delete the journal.
+- **Complete journal** (header starts with `LVJRNL01`; its length and CRC-32 match the
+  content): the new content follows the 32-byte header. Copy it over the object
+  (`tail -c +33 journal > object`), then delete the journal.
 - **Incomplete journal** (all-zero header): delete it; the object was never touched.
 
 ## Errors

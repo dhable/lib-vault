@@ -118,8 +118,7 @@ async fn a_leftover_journal_is_reported_even_without_journaling() {
     std::fs::write(v.path("a/.vault-journal-f"), b"partial").unwrap();
     c.release().unwrap();
 
-    let unjournaled =
-        lib_vault_posix::vault(&v.root, FsStoreOptions::default().journaling(false)).unwrap();
+    let unjournaled = fs_vault(&v.root, FsStoreOptions::default().journaling(false));
     let mut c = unjournaled.claim(key("a")).await.unwrap();
     let err = read(&mut c, "f").await.unwrap_err();
     assert!(

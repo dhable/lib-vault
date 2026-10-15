@@ -74,7 +74,7 @@ fn child_holds_claim() {
     };
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let vault = lib_vault_posix::vault(&root, Default::default()).unwrap();
+        let vault = fs_vault(&root, Default::default());
         let _claim = vault.claim(key(&k)).await.unwrap();
         println!("LV_CHILD_HELD");
         std::thread::sleep(std::time::Duration::from_secs(60));

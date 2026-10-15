@@ -6,9 +6,9 @@
 //! to the locked inode. Intermediate directories are created as needed; the object itself is
 //! only created on write.
 
-use crate::PosixError;
 use crate::fsops;
 use crate::root::Root;
+use crate::{FsStore, PosixError};
 use futures::future::BoxFuture;
 use lib_vault::{ClaimLock, Claimer, Error, Key};
 use std::fs::{File, TryLockError};
@@ -16,15 +16,26 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
 
-/// The [`Claimer`] paired with [`FsStore`](crate::FsStore) (D45): it locks lock files inside
-/// the store's own directory tree, so it only works with the store it came from
-/// ([`FsStore::claimer`](crate::FsStore::claimer)).
+/// A [`Claimer`] that locks hidden lock files with `flock`, inside an [`FsStore`]'s directory
+/// tree (D45, D75). It only works with the `FsStore` it was created from; the store itself
+/// works with any claimer.
 ///
-/// Exclusion holds across threads, `Vault`s and processes that use the same vault root,
-/// because `flock` locks belong to open file descriptions, not processes.
+/// Exclusion holds across threads, `Vault`s and processes on one host that use the same vault
+/// root, because `flock` locks belong to open file descriptions, not processes. It doesn't
+/// coordinate with other claimers: every process using the root must use `FsClaimer`.
 #[derive(Clone)]
 pub struct FsClaimer {
-    pub(crate) root: Arc<Root>,
+    root: Arc<Root>,
+}
+
+impl FsClaimer {
+    /// A claimer that locks inside `store`'s vault root. Use it only in a `Vault` over `store`
+    /// (or a clone of it).
+    pub fn new(store: &FsStore) -> Self {
+        Self {
+            root: store.root.clone(),
+        }
+    }
 }
 
 impl Claimer for FsClaimer {

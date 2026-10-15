@@ -1,6 +1,5 @@
 //! `FsStore`: objects are regular files under the vault root, one per key (§8).
 
-use crate::claimer::FsClaimer;
 use crate::fsops;
 use crate::journal::{self, Crc32};
 use crate::root::Root;
@@ -39,9 +38,14 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 /// - Symlinks, hard-linked files, special files and mount crossings are refused (D17).
 /// - Creating a key that differs only by ASCII case from an existing object fails with
 ///   [`PosixError::CaseCollision`] (D6).
+///
+/// **Works with any [`Claimer`](lib_vault::Claimer)** (D75): the store never relies on the
+/// claimer, which only decides who may claim a key. Use [`FsClaimer`](crate::FsClaimer) for
+/// processes on one host, or a distributed claimer when hosts share the storage. Every process
+/// using a vault root must use the same kind of claimer, or they won't exclude each other.
 #[derive(Clone)]
 pub struct FsStore {
-    root: Arc<Root>,
+    pub(crate) root: Arc<Root>,
 }
 
 impl FsStore {
@@ -54,13 +58,6 @@ impl FsStore {
         Ok(Self {
             root: Arc::new(root),
         })
-    }
-
-    /// The claimer for this store (D45). Use it with this store only.
-    pub fn claimer(&self) -> FsClaimer {
-        FsClaimer {
-            root: self.root.clone(),
-        }
     }
 
     /// The vault root's canonical path.

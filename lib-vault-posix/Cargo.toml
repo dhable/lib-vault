@@ -19,3 +19,4 @@ tokio-util = { workspace = true, features = ["compat"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process"] }
 futures = { workspace = true, features = ["executor"] }
 tempfile.workspace = true
+lib-vault-memory.workspace = true

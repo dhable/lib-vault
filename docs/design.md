@@ -323,9 +323,14 @@ These are documented on the traits in `lib-vault/src/claimer.rs`:
 - **Cancellation**: if the `try_lock` future is dropped before completing, anything partially
   acquired is released; a lock is never held without a returned `ClaimLock`.
 - **Errors**: conflict, or the backend refusing or being unreachable.
-- **Pairing with a store** (D45, resolves P37): some claimers lock the store's own storage
-  (`FsClaimer` locks `FsStore`'s directories). Each claimer documents which stores it works
-  with; `Vault::new` doesn't check.
+- **Pairing with a store** (D45, D75, resolves P37): the store and the claimer are chosen
+  separately, and a vault is always built with `Vault::new(store, claimer)`. Pairing is
+  one-directional: some claimers lock the store's own storage (`FsClaimer` locks lock files in
+  `FsStore`'s tree, so `FsClaimer::new` takes the `&FsStore`), but stores never depend on a
+  claimer (`FsStore` works with `FsClaimer`, `MemoryClaimer` or a future distributed claimer).
+  Each claimer documents which stores it works with; `Vault::new` doesn't check. Every process
+  sharing a store's data must use the same kind of claimer, since different claimers don't
+  see each other's claims; this is documented, not detected.
 - **`ClaimLock::release`** is synchronous and non-blocking; the implementation handles any
   async work itself. It returns `Ok` only once the key can be claimed again immediately (D39,
   §4.4). It's called from `Claim::release` or `Claim::drop`.
@@ -412,8 +417,9 @@ trait using `async fn` can't be used as `dyn Trait` and can't promise its future
 An `async fn`'s `Send`-ness is inferred, so it can be lost silently (as the v6 `claim`, which
 held a `MutexGuard` across `.await`, showed); §13 asserts it.
 
-**Build status:** the workspace builds and 97 tests pass (`lib-vault`: 17 unit;
-`lib-vault-memory`: 41 integration + 2 doc; `lib-vault-posix`: 1 unit + 35 integration + 1 doc),
+**Build status:** the workspace builds and 103 tests pass (`lib-vault`: 17 unit + 1 doc;
+`lib-vault-memory`: 41 integration + 4 doc; `lib-vault-posix`: 1 unit + 37 integration + 2 doc;
+the doc counts include each crate's README examples),
 including the compile-time `Send` checks for `SharedMode`; clippy and `cargo doc` are clean; the
 `Claim::list` example is `ignore`d. Known leftovers: a stale `REVIEW(nit)` comment above the
 `try_lock` docs, and some doc-comment typos.
@@ -431,9 +437,11 @@ Since v3: `Vault::new(root)` / `new_shared`, `shutdown_timeout`, `Claim<'a>` lif
 ## 8. Filesystem backend (`FsStore` + `FsClaimer`)
 
 The first backend, implemented in `lib-vault-posix` (D73): `FsStore` implements
-`Store<SharedMode>` and `FsClaimer` is its paired claimer (D45). It requires the app to run on a
-tokio runtime (D56). This was the whole design before v4; it now describes one `Store` and one
-`Claimer` that must be used together.
+`Store<SharedMode>`, and `FsClaimer` is the claimer built for it (D45, D75). It requires the app
+to run on a tokio runtime (D56). `FsStore` works with any claimer (it creates its own
+directories and never touches lock files); `FsClaimer` works only with an `FsStore`
+(`FsClaimer::new(&store)`). §8.3 describes `FsClaimer`; with another claimer, no lock files
+exist and exclusion is that claimer's.
 
 ### 8.1 Confinement: race-free, handle-relative resolution
 
@@ -616,7 +624,7 @@ root.
 | Crate | Contents |
 |---|---|
 | `lib-vault` | the core API: `Vault<M>`, `Claim<M>`, `Key`, the `Store<M>` / `Claimer` / `ClaimLock` traits, the I/O modes in `rt`, `Error` |
-| `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<SharedMode>`), `FsClaimer`, `FsStoreOptions`, `Sharing`, `PosixError`, `vault()`; requires a tokio runtime (D56) |
+| `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<SharedMode>`, any claimer), `FsClaimer` (`FsStore` only), `FsStoreOptions`, `Sharing`, `PosixError`; requires a tokio runtime (D56) |
 | `lib-vault-memory` | the in-memory backend for tests and getting started (D51): `MemoryStore`, `MemoryClaimer`, `vault()`; integration tests in `tests/` exercise the core API against it |
 
 Modules in `lib-vault/src/`:
@@ -636,7 +644,7 @@ Modules in `lib-vault-posix/src/`:
 
 | Module | Contents |
 |---|---|
-| `lib.rs` | re-exports, `vault(root, options)` |
+| `lib.rs` | re-exports, crate docs (choosing a claimer) |
 | `store.rs` | `FsStore`: list, delete, open, the buffered writer and the commit |
 | `claimer.rs` | `FsClaimer`: lock-file v1 with verify-after-lock (D67, D66) |
 | `root.rs` | root opening and the construction checks (§9) |
