@@ -2,9 +2,15 @@
 name = "lib-vault"
 version.workspace = true
 edition.workspace = true
+description = "Core API for confined, exclusively claimed storage for AI harnesses"
+readme = "README.md"
 
 [dependencies]
 tracing.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
+
+[dev-dependencies]
+lib-vault-memory.workspace = true
+futures = { workspace = true, features = ["executor"] }

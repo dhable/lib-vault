@@ -2,6 +2,8 @@
 name = "lib-vault-memory"
 version.workspace = true
 edition.workspace = true
+description = "In-memory lib-vault backend for tests and prototyping"
+readme = "README.md"
 
 [dependencies]
 lib-vault.workspace = true

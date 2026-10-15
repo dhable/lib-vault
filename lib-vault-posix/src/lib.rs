@@ -42,6 +42,11 @@ pub use error::PosixError;
 pub use options::{FsStoreOptions, Sharing};
 pub use store::FsStore;
 
+// Compile and run the README examples as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 use lib_vault::{Vault, rt::SharedMode};
 use std::path::Path;
 

@@ -12,3 +12,8 @@ pub use error::*;
 pub use key::*;
 pub use store::*;
 pub use vault::*;
+
+// Compile and run the README examples as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

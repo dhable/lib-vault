@@ -43,6 +43,11 @@ mod store;
 pub use claimer::MemoryClaimer;
 pub use store::MemoryStore;
 
+// Compile and run the README examples as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 use lib_vault::{Key, Vault, rt};
 use std::io;
 

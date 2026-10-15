@@ -21,3 +21,4 @@ tempfile = "3"
 
 # Workspace crates, referenced by path.
 lib-vault = { path = "lib-vault" }
+lib-vault-memory = { path = "lib-vault-memory" }
