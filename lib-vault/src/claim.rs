@@ -12,7 +12,7 @@ use std::task::Waker;
 /// state of the object.
 pub struct Claim<M: rt::IoMode> {
     base: Key,
-    store: Arc<dyn Store<M>>,
+    store: M::StorePtr,
     lock: Option<Box<dyn ClaimLock>>,
     state: Arc<Mutex<VaultState>>,
 }
@@ -20,7 +20,7 @@ pub struct Claim<M: rt::IoMode> {
 impl<M: rt::IoMode> Claim<M> {
     // Create a new claim instance with the `Store` keys scoped to `base`. Intended
     // to be used by `Vault` to create a claim after a claim's lock is obtained.
-    pub(crate) fn new(store: Arc<dyn Store<M>>, base: Key, state: Arc<Mutex<VaultState>>) -> Self {
+    pub(crate) fn new(store: M::StorePtr, base: Key, state: Arc<Mutex<VaultState>>) -> Self {
         Self {
             store,
             base,
@@ -144,33 +144,27 @@ mod tests {
         fn test_send_marker() {
             // This test is just a compile time guard to ensure that `Claim` will implement `Send`.
             // This is our guarantee that changes to `Claim` do not elminate this implict marker.
-            // `Send` can only be proven for concrete types, so every `IoMode` is checked.
-            use crate::rt::{IoMode, OwnedMode, SharedMode};
+            //
+            // Only `SharedMode` promises `Send`: an `OwnedMode` store may hold `!Send` runtime
+            // state, so `Claim<OwnedMode>` and `Vault<OwnedMode>` hold it in an `Rc` and are
+            // deliberately `!Send` (one vault per thread on thread-per-core runtimes).
+            use crate::rt::SharedMode;
             use crate::{Key, Vault};
 
             fn assert_send<T: Send>() {}
             fn assert_vault<T: Send + Sync + Clone>() {}
             fn assert_send_value<T: Send>(_: &T) {}
 
-            fn mode<M: IoMode>()
-            where
-                Claim<M>: Send,
-                Vault<M>: Send + Sync + Clone,
-            {
-                assert_send::<Claim<M>>();
-                assert_vault::<Vault<M>>();
-            }
-            mode::<SharedMode>();
-            mode::<OwnedMode>();
+            assert_send::<Claim<SharedMode>>();
+            assert_vault::<Vault<SharedMode>>();
 
             // `Vault` is shared across threads, and its futures must stay spawnable on
             // multi-threaded runtimes (design §13).
-            fn futures_are_send<M: IoMode>(vault: Vault<M>) {
+            fn futures_are_send(vault: Vault<SharedMode>) {
                 assert_send_value(&vault.claim(Key::new("a").unwrap()));
                 assert_send_value(&vault.shutdown());
             }
-            let _ = futures_are_send::<SharedMode>;
-            let _ = futures_are_send::<OwnedMode>;
+            let _ = futures_are_send;
         }
     }
 }

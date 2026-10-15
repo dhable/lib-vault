@@ -1,4 +1,5 @@
-use crate::{Claim, Claimer, Error, Key, Store, rt};
+use crate::rt::{self, IntoStorePtr};
+use crate::{Claim, Claimer, Error, Key};
 use std::future;
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
@@ -15,7 +16,7 @@ pub(crate) struct VaultState {
 /// The Vault is the entry point to setting up storage and a locking strategy for
 /// working with long lived data.
 pub struct Vault<M: rt::IoMode> {
-    store: Arc<dyn Store<M>>,
+    store: M::StorePtr,
     claimer: Arc<dyn Claimer>,
     state: Arc<Mutex<VaultState>>,
 }
@@ -23,9 +24,9 @@ pub struct Vault<M: rt::IoMode> {
 impl<M: rt::IoMode> Vault<M> {
     /// Creates a new Vault given an implementation of a storage engine `store` and
     /// a claim locking engine `claimer`.
-    pub fn new(store: impl Store<M>, claimer: impl Claimer) -> Self {
+    pub fn new(store: impl IntoStorePtr<M>, claimer: impl Claimer) -> Self {
         Self {
-            store: Arc::new(store),
+            store: store.into_store_ptr(),
             claimer: Arc::new(claimer),
             state: Arc::new(Mutex::new(Default::default())),
         }
@@ -90,8 +91,8 @@ impl<M: rt::IoMode> Clone for Vault<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ClaimLock;
     use crate::rt::shared::{ObjectReader, ObjectWriter};
+    use crate::{ClaimLock, Store};
     use futures::FutureExt;
     use futures::future::{self, BoxFuture};
     use std::sync::atomic::{AtomicUsize, Ordering};

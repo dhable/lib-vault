@@ -9,7 +9,7 @@ use crate::{Error, Key, rt};
 ///
 /// Note for implementors: the returned futures borrow `self` (`'a`) but not `key`. Clone the
 /// key (cheap: it's an `Arc<str>`) into the future rather than borrowing it.
-pub trait Store<M: rt::IoMode>: Send + Sync + 'static {
+pub trait Store<M: rt::IoMode>: 'static {
     /// Returns the keys of all objects beneath `key` (component-wise), relative to `key`.
     fn list(&self, key: &Key) -> M::Fut<'_, Result<Vec<Key>, Error>>;
 
