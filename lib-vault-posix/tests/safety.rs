@@ -1,80 +1,108 @@
 //! Links, special files (D17) and the construction-time checks on the vault root (§9, D64,
 //! D70).
 
-mod common;
-
-use common::*;
-use lib_vault_posix::{FsStoreOptions, PosixError, Sharing};
+use futures::AsyncWriteExt;
+use lib_vault::{Error, Key, Vault};
+use lib_vault_posix::{FsClaimer, FsStore, FsStoreOptions, PosixError, Sharing};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
-fn unsupported(err: &lib_vault::Error) -> bool {
-    matches!(posix(err), Some(PosixError::Unsupported { .. }))
+fn unsupported(err: &Error) -> bool {
+    matches!(err, Error::StoreError(e) if matches!(
+        e.downcast_ref::<PosixError>(),
+        Some(PosixError::Unsupported { .. })
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn symlinked_objects_are_refused_and_not_listed() {
-    let v = TempVault::new();
-    let mut c = v.claim("a").await;
-    write(&mut c, "real", b"x").await;
-    let outside = v.dir.path().join("secret");
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path().join("vault"), FsStoreOptions::default()).unwrap();
+    let root = store.root_path().to_owned();
+    let claimer = FsClaimer::new(&store);
+    let v = Vault::new(store, claimer);
+    let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
+    let mut w = c.open_write("real").await.unwrap();
+    w.write_all(b"x").await.unwrap();
+    w.close().await.unwrap();
+    drop(w);
+    let outside = dir.path().join("secret");
     std::fs::write(&outside, b"outside the vault").unwrap();
-    symlink(&outside, v.path("a/link")).unwrap();
+    symlink(&outside, root.join("a/link")).unwrap();
 
-    let err = read(&mut c, "link").await.unwrap_err();
+    let err = c.open_read("link").await.err().unwrap();
     assert!(unsupported(&err), "{err:?}");
     let err = c.open_write("link").await.err().unwrap();
     assert!(unsupported(&err), "{err:?}");
-    assert_eq!(list(&mut c, None).await, ["real"]);
+    let keys = c.list(None).await.unwrap();
+    assert_eq!(keys.iter().map(Key::as_str).collect::<Vec<_>>(), ["real"]);
     assert_eq!(std::fs::read(&outside).unwrap(), b"outside the vault");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn symlinked_directories_are_never_followed() {
-    let v = TempVault::new();
-    let outside = v.dir.path().join("elsewhere");
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path().join("vault"), FsStoreOptions::default()).unwrap();
+    let root = store.root_path().to_owned();
+    let claimer = FsClaimer::new(&store);
+    let v = Vault::new(store, claimer);
+    let outside = dir.path().join("elsewhere");
     std::fs::create_dir(&outside).unwrap();
     std::fs::write(outside.join("f"), b"outside").unwrap();
-    std::fs::create_dir(v.path("a")).unwrap();
-    symlink(&outside, v.path("a/dir")).unwrap();
+    std::fs::create_dir(root.join("a")).unwrap();
+    symlink(&outside, root.join("a/dir")).unwrap();
 
-    let mut c = v.claim("a").await;
-    let err = read(&mut c, "dir/f").await.unwrap_err();
+    let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
+    let err = c.open_read("dir/f").await.err().unwrap();
     assert!(unsupported(&err), "{err:?}");
     let err = c.open_write("dir/g").await.err().unwrap();
     assert!(unsupported(&err), "{err:?}");
     assert!(!outside.join("g").exists());
     // Claiming through the symlink fails too.
     drop(c);
-    assert!(v.vault.claim(key("a/dir/f")).await.is_err());
+    assert!(v.claim(Key::new("a/dir/f").unwrap()).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn hard_linked_objects_are_refused() {
-    let v = TempVault::new();
-    let mut c = v.claim("a").await;
-    write(&mut c, "f", b"x").await;
-    std::fs::hard_link(v.path("a/f"), v.dir.path().join("alias")).unwrap();
-    let err = read(&mut c, "f").await.unwrap_err();
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path().join("vault"), FsStoreOptions::default()).unwrap();
+    let root = store.root_path().to_owned();
+    let claimer = FsClaimer::new(&store);
+    let v = Vault::new(store, claimer);
+    let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
+    let mut w = c.open_write("f").await.unwrap();
+    w.write_all(b"x").await.unwrap();
+    w.close().await.unwrap();
+    drop(w);
+    std::fs::hard_link(root.join("a/f"), dir.path().join("alias")).unwrap();
+    let err = c.open_read("f").await.err().unwrap();
     assert!(unsupported(&err), "{err:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fifos_are_refused_without_blocking() {
-    let v = TempVault::new();
-    let mut c = v.claim("a").await;
-    write(&mut c, "f", b"x").await; // creates the directory
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path().join("vault"), FsStoreOptions::default()).unwrap();
+    let root = store.root_path().to_owned();
+    let claimer = FsClaimer::new(&store);
+    let v = Vault::new(store, claimer);
+    let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
+    let mut w = c.open_write("f").await.unwrap(); // creates the directory
+    w.write_all(b"x").await.unwrap();
+    w.close().await.unwrap();
+    drop(w);
     let status = std::process::Command::new("mkfifo")
-        .arg(v.path("a/pipe"))
+        .arg(root.join("a/pipe"))
         .status()
         .unwrap();
     assert!(status.success());
-    let err = read(&mut c, "pipe").await.unwrap_err();
+    let err = c.open_read("pipe").await.err().unwrap();
     assert!(unsupported(&err), "{err:?}");
 }
 
 fn root_error(root: &Path, options: FsStoreOptions) -> PosixError {
-    match open_store(root, options) {
+    match FsStore::new(root, options) {
         Err(e) => e,
         Ok(_) => panic!("expected {} to be refused", root.display()),
     }
@@ -113,14 +141,14 @@ fn the_root_mode_must_match_the_sharing_mode() {
     assert!(matches!(err, PosixError::InvalidRoot { .. }), "{err}");
 
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    open_store(&root, FsStoreOptions::default()).unwrap();
+    FsStore::new(&root, FsStoreOptions::default()).unwrap();
 }
 
 #[test]
 fn a_new_root_is_created_with_the_sharing_mode() {
     let dir = tempfile::tempdir().unwrap();
     let private = dir.path().join("private");
-    open_store(&private, FsStoreOptions::default()).unwrap();
+    FsStore::new(&private, FsStoreOptions::default()).unwrap();
     assert_eq!(
         std::fs::metadata(&private).unwrap().permissions().mode() & 0o7777,
         0o700
@@ -128,7 +156,7 @@ fn a_new_root_is_created_with_the_sharing_mode() {
 
     let gid = rustix_gid();
     let shared = dir.path().join("shared");
-    open_store(
+    FsStore::new(
         &shared,
         FsStoreOptions::default().sharing(Sharing::Group(gid)),
     )
@@ -164,14 +192,14 @@ fn strict_modes_refuse_a_group_or_world_writable_ancestor() {
         other => panic!("expected StrictModes, got {other}"),
     }
     // With strict modes off, the same root is accepted.
-    open_store(&root, FsStoreOptions::default().strict_modes(false)).unwrap();
+    FsStore::new(&root, FsStoreOptions::default().strict_modes(false)).unwrap();
 }
 
 #[test]
 fn a_root_with_extended_acls_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("vault");
-    open_store(&root, FsStoreOptions::default()).unwrap();
+    FsStore::new(&root, FsStoreOptions::default()).unwrap();
 
     let added = if cfg!(target_vendor = "apple") {
         std::process::Command::new("chmod")

@@ -41,6 +41,7 @@ the sketch wins and this log is out of date.
 | D8 | Quotas | Not enforced in-library; deferred to the backend / OS. | §9 |
 | D4 | Deployment model | In-process library only. No process-wide self-sandboxing. | §9 |
 | D5 | Multiple applications | Apps may run as different uids/gids, with no shared config or agreement beyond "same backend + lib-vault". | §6 |
+| D76 | Tests as usage examples | Integration tests double as examples of the public API, so **tests call the API directly**: no shared `tests/common` module and no helpers that wrap API calls (building a vault, claiming, writing, reading, listing, downcasting a backend error). A test builds its vault with `Vault::new(store, claimer)`, claims with `v.claim(Key::new(..).unwrap())`, writes with `open_write` → `write_all` → `close()` → `drop(w)`, and reads with `open_read` → `read_to_end` → `drop(r)` (the explicit drops are required by D42). The verbosity is accepted: it shows what callers write. **Helpers are fine** for test machinery that isn't API usage: filesystem inspection (`tree`), thread and timing plumbing (`spawn_shutdown`), or one assertion repeated within a single file (`refused`, `unsupported`). Such helpers stay file-local, even if that means duplicating one in two files. | §12 |
 
 ### Filesystem backend (`FsStore` + `FsClaimer`)
 These were core decisions when the vault was filesystem-only. They now describe the first backend.
@@ -194,4 +195,5 @@ any runtime, and must not block or panic (`design.md` §4.4).
 | D41, D46, D47 shutdown | ✅ Guard dropped before `.await`; refused/cancelled claims give their count back; `Drop` counts down and wakes waiters; shutting down returns `Error::ShuttingDown`. |
 | D12 errors | ✅ `thiserror` enum. |
 | D51 memory backend | ✅ `Store<SharedMode>` only. |
+| D76 tests as examples | ✅ `lib-vault-memory/tests` and `lib-vault-posix/tests` call the API directly; both `tests/common` modules removed. |
 | D73 posix backend | ✅ `FsStore` + `FsClaimer`, journaling, strict modes, ACL refusal, network warning, lock files, create-on-write; 39 tests pass on macOS. D75: `FsStore` composes with any claimer (`FsClaimer::new(&store)`), tested with `MemoryClaimer`. ⚠ Not yet run on Linux. |
