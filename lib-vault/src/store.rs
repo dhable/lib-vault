@@ -1,8 +1,5 @@
 use crate::{Error, Key, rt};
 
-// TODO: this is temporary until the sketch it further completed
-// use crate::rt::shared::{ObjectReader, ObjectWriter};
-
 /// Interface required for any strategy used for storing the actual object data. Our first
 /// implementation will be a file system but it could also be a database, object store or
 /// in memory.

@@ -48,8 +48,6 @@ pub trait ClaimLock: Send {
 pub trait Claimer: Send + Sync + 'static {
     /// Tries to take an exclusive lock on `key` and everything beneath it.
     ///
-    // REVIEW(nit): the link below to `ClaimLock::try_release` is dead (`cargo doc` warns), and
-    // the `futures` `executor` feature in Cargo.toml is now unused (nothing calls `block_on`).
     /// Returns the held lock on success. The lock stays held until it is released with
     /// [`ClaimLock::release`].
     ///

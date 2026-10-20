@@ -78,6 +78,9 @@ impl<M: rt::IoMode> Vault<M> {
     }
 }
 
+// The `IoMode` type parameter doesn't need to implement `Clone` since it's
+// just a method of passing bundled type information around. The derive macro
+// doesn't know that exception so a verbose `Clone` implementation is required.
 impl<M: rt::IoMode> Clone for Vault<M> {
     fn clone(&self) -> Self {
         Self {
