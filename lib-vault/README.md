@@ -36,12 +36,12 @@ vault.shutdown().await; // waits for outstanding claims
 
 | Type | Role |
 |---|---|
-| `Vault<M>` | Entry point. Pairs a store with a claimer and hands out claims. Cheap to clone. |
-| `Claim<M>` | Exclusive hold on a key and everything beneath it. The only way to `list`, `delete`, `open_read`, `open_write`. |
+| `Vault<D>` | Entry point. Pairs a store with a claimer and hands out claims. Cheap to clone. |
+| `Claim<D>` | Exclusive hold on a key and everything beneath it. The only way to `list`, `delete`, `open_read`, `open_write`. |
 | `Key` | Validated, relative, `/`-separated name. Cheap to clone (`Arc<str>`). |
-| `Store<M>` | Backend trait for object data. |
+| `Store<D>` | Backend trait for object data. |
 | `Claimer` / `ClaimLock` | Backend trait for exclusion, and the lock it returns. |
-| `rt::SharedMode` / `rt::OwnedMode` | I/O mode: which future, reader and writer types the API uses. |
+| `io_driver::AsyncIoDriver` / `io_driver::OwnedBufDriver` | I/O driver: which future, reader and writer types the API uses. |
 
 ## Keys
 
@@ -63,25 +63,25 @@ vault.shutdown().await; // waits for outstanding claims
   released while a handle is open.
 - **Shutdown**: `vault.shutdown()` refuses new claims and waits for outstanding ones.
 
-## I/O modes
+## I/O drivers
 
-| | `SharedMode` | `OwnedMode` |
+| | `AsyncIoDriver` | `OwnedBufDriver` |
 |---|---|---|
 | Runtimes | Work-stealing (tokio, async-std, smol) | Thread-per-core (monoio, tokio-uring, glommio) |
 | Futures | `BoxFuture` (`Send`) | `LocalBoxFuture` |
 | Reader / writer | `futures` `AsyncRead` / `AsyncWrite` | Stream of `Bytes` / `ObjectWrite` (owned buffers) |
 | `Vault` / `Claim` | `Send` (`Vault` is also `Sync`) | `!Send`: one vault per thread |
 
-Both current backends implement `SharedMode`.
+Both current backends implement `AsyncIoDriver`. `IoDriver` is open: a backend may define its own driver (for example, typed values for a structured store) and implement `IntoStorePtr<S>` for it.
 
 ## Writing a backend
 
 ```rust,ignore
-pub trait Store<M: rt::IoMode>: 'static {
-    fn list(&self, key: &Key) -> M::Fut<'_, Result<Vec<Key>, Error>>;
-    fn delete<'a>(&'a self, key: &Key) -> M::Fut<'a, Result<(), Error>>;
-    fn open_read<'a>(&'a self, key: &Key) -> M::Fut<'a, Result<M::Reader<'a>, Error>>;
-    fn open_write<'a>(&'a self, key: &Key) -> M::Fut<'a, Result<M::Writer<'a>, Error>>;
+pub trait Store<D: io_driver::IoDriver>: 'static {
+    fn list(&self, key: &Key) -> D::Fut<'_, Result<Vec<Key>, Error>>;
+    fn delete<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<(), Error>>;
+    fn open_read<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<D::Reader<'a>, Error>>;
+    fn open_write<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<D::Writer<'a>, Error>>;
 }
 
 pub trait Claimer: Send + Sync + 'static {

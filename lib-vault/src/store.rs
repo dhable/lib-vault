@@ -1,4 +1,4 @@
-use crate::{Error, Key, rt};
+use crate::{Error, Key, io_driver};
 
 /// Interface required for any strategy used for storing the actual object data. Our first
 /// implementation will be a file system but it could also be a database, object store or
@@ -6,18 +6,18 @@ use crate::{Error, Key, rt};
 ///
 /// Note for implementors: the returned futures borrow `self` (`'a`) but not `key`. Clone the
 /// key (cheap: it's an `Arc<str>`) into the future rather than borrowing it.
-pub trait Store<M: rt::IoMode>: 'static {
+pub trait Store<D: io_driver::IoDriver>: 'static {
     /// Returns the keys of all objects beneath `key` (component-wise), relative to `key`.
-    fn list(&self, key: &Key) -> M::Fut<'_, Result<Vec<Key>, Error>>;
+    fn list(&self, key: &Key) -> D::Fut<'_, Result<Vec<Key>, Error>>;
 
     /// Deletes the object at `key`. Succeeds if there is no such object.
-    fn delete<'a>(&'a self, key: &Key) -> M::Fut<'a, Result<(), Error>>;
+    fn delete<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<(), Error>>;
 
     /// Opens the object at `key` for reading. Errors if there is no such object.
-    fn open_read<'a>(&'a self, key: &Key) -> M::Fut<'a, Result<M::Reader<'a>, Error>>;
+    fn open_read<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<D::Reader<'a>, Error>>;
 
     /// Opens the object at `key` for writing, creating or overwriting it. Implementations
     /// document when written data is committed (e.g. on `close()`). Must fail if `key` differs
     /// only by ASCII case from an existing object's key, so `Foo` and `foo` never coexist.
-    fn open_write<'a>(&'a self, key: &Key) -> M::Fut<'a, Result<M::Writer<'a>, Error>>;
+    fn open_write<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<D::Writer<'a>, Error>>;
 }

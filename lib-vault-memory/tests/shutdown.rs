@@ -1,12 +1,12 @@
 //! Vault shutdown against the memory backend (design §4.5, D13, D41, D46, D47).
 
 use futures::executor::block_on;
-use lib_vault::{Error, Key, Vault, rt};
+use lib_vault::{Error, Key, Vault, io_driver};
 use lib_vault_memory::{MemoryClaimer, MemoryStore};
 use std::thread;
 use std::time::Duration;
 
-fn spawn_shutdown(v: &Vault<rt::SharedMode>) -> thread::JoinHandle<()> {
+fn spawn_shutdown(v: &Vault<io_driver::AsyncIoDriver>) -> thread::JoinHandle<()> {
     let v = v.clone();
     thread::spawn(move || block_on(v.shutdown()))
 }

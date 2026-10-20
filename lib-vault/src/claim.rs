@@ -1,4 +1,4 @@
-use crate::{AsKeyRef, ClaimLock, Error, Key, KeyError, Store, VaultState, rt};
+use crate::{AsKeyRef, ClaimLock, Error, Key, KeyError, Store, VaultState, io_driver};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
@@ -10,17 +10,17 @@ use std::task::Waker;
 /// any purpose (e.g. `Claim` does not impelemtn `Sync`). This is done by requiring a mutable
 /// reference to use any method on the `Claim`. It does not mean that every method changes the
 /// state of the object.
-pub struct Claim<M: rt::IoMode> {
+pub struct Claim<D: io_driver::IoDriver> {
     base: Key,
-    store: M::StorePtr,
+    store: D::StorePtr,
     lock: Option<Box<dyn ClaimLock>>,
     state: Arc<Mutex<VaultState>>,
 }
 
-impl<M: rt::IoMode> Claim<M> {
+impl<D: io_driver::IoDriver> Claim<D> {
     // Create a new claim instance with the `Store` keys scoped to `base`. Intended
     // to be used by `Vault` to create a claim after a claim's lock is obtained.
-    pub(crate) fn new(store: M::StorePtr, base: Key, state: Arc<Mutex<VaultState>>) -> Self {
+    pub(crate) fn new(store: D::StorePtr, base: Key, state: Arc<Mutex<VaultState>>) -> Self {
         Self {
             store,
             base,
@@ -68,7 +68,7 @@ impl<M: rt::IoMode> Claim<M> {
     /// Opens a specific object at `base` + `key` for reading. The resulting reader is valid
     /// for the duration of the claim. Reading a key that does not point an object will return
     /// an error. `None` means the claimed key itself.
-    pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<M::Reader<'a>, Error> {
+    pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<D::Reader<'a>, Error> {
         let key = key.into_key()?;
         let resolved_key = resolve_key(&self.base, key.as_ref())?;
         self.store.open_read(&resolved_key).await
@@ -82,7 +82,7 @@ impl<M: rt::IoMode> Claim<M> {
     /// Writing to a key pointing at an existing object should overwrite the exiting object data.
     /// Writing to a key that does not have an object will create the object with the given key.
     /// `None` means the claimed key itself.
-    pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<M::Writer<'a>, Error> {
+    pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<D::Writer<'a>, Error> {
         let key = key.into_key()?;
         let resolved_key = resolve_key(&self.base, key.as_ref())?;
         self.store.open_write(&resolved_key).await
@@ -104,14 +104,14 @@ fn resolve_key(base: &Key, key: Option<&Key>) -> Result<Key, KeyError> {
 // Helper function that implements the resuable logic around taking the lock from
 // the strut and calling release on it. Must be callable from both the `Drop`
 // implementation as well as `Claim::release`.
-fn release_lock<M: rt::IoMode>(claim: &mut Claim<M>) -> Result<(), Error> {
+fn release_lock<D: io_driver::IoDriver>(claim: &mut Claim<D>) -> Result<(), Error> {
     if let Some(lock) = claim.lock.take() {
         lock.release()?;
     }
     Ok(())
 }
 
-impl<M: rt::IoMode> Drop for Claim<M> {
+impl<D: io_driver::IoDriver> Drop for Claim<D> {
     fn drop(&mut self) {
         // Attempt to release the lock if it hasn't been. Funnels errors to the
         // tracing crate as a best attempt to expose errors.
@@ -145,22 +145,22 @@ mod tests {
             // This test is just a compile time guard to ensure that `Claim` will implement `Send`.
             // This is our guarantee that changes to `Claim` do not elminate this implict marker.
             //
-            // Only `SharedMode` promises `Send`: an `OwnedMode` store may hold `!Send` runtime
-            // state, so `Claim<OwnedMode>` and `Vault<OwnedMode>` hold it in an `Rc` and are
+            // Only `AsyncIoDriver` promises `Send`: an `OwnedBufDriver` store may hold `!Send` runtime
+            // state, so `Claim<OwnedBufDriver>` and `Vault<OwnedBufDriver>` hold it in an `Rc` and are
             // deliberately `!Send` (one vault per thread on thread-per-core runtimes).
-            use crate::rt::SharedMode;
+            use crate::io_driver::AsyncIoDriver;
             use crate::{Key, Vault};
 
             fn assert_send<T: Send>() {}
             fn assert_vault<T: Send + Sync + Clone>() {}
             fn assert_send_value<T: Send>(_: &T) {}
 
-            assert_send::<Claim<SharedMode>>();
-            assert_vault::<Vault<SharedMode>>();
+            assert_send::<Claim<AsyncIoDriver>>();
+            assert_vault::<Vault<AsyncIoDriver>>();
 
             // `Vault` is shared across threads, and its futures must stay spawnable on
             // multi-threaded runtimes (design §13).
-            fn futures_are_send(vault: Vault<SharedMode>) {
+            fn futures_are_send(vault: Vault<AsyncIoDriver>) {
                 assert_send_value(&vault.claim(Key::new("a").unwrap()));
                 assert_send_value(&vault.shutdown());
             }

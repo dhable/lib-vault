@@ -2,10 +2,10 @@
 //! `ClaimLock` / `Claim::release` rules (§4.4, D11, D39).
 
 use futures::executor::block_on;
-use lib_vault::{Error, Key, Vault, rt};
+use lib_vault::{Error, Key, Vault, io_driver};
 use lib_vault_memory::{MemoryClaimer, MemoryStore};
 
-fn refused(v: &Vault<rt::SharedMode>, k: &str) -> bool {
+fn refused(v: &Vault<io_driver::AsyncIoDriver>, k: &str) -> bool {
     match block_on(v.claim(Key::new(k).unwrap())) {
         Err(Error::AlreadyClaimed { key: refused }) => {
             assert_eq!(refused, Key::new(k).unwrap());

@@ -34,8 +34,8 @@ use lib_vault::Vault;
 use lib_vault_memory::{MemoryClaimer, MemoryStore};
 
 let (store, claimer) = (MemoryStore::new(), MemoryClaimer::new());
-let a: Vault<lib_vault::rt::SharedMode> = Vault::new(store.clone(), claimer.clone());
-let b: Vault<lib_vault::rt::SharedMode> = Vault::new(store, claimer);
+let a: Vault<lib_vault::io_driver::AsyncIoDriver> = Vault::new(store.clone(), claimer.clone());
+let b: Vault<lib_vault::io_driver::AsyncIoDriver> = Vault::new(store, claimer);
 ```
 
 ## Behavior
@@ -51,5 +51,5 @@ let b: Vault<lib_vault::rt::SharedMode> = Vault::new(store, claimer);
 
 ## Requirements
 
-- `SharedMode` only.
+- `AsyncIoDriver` only.
 - No async runtime: works with tokio, any other runtime, or `futures::executor::block_on`.

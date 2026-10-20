@@ -95,5 +95,5 @@ cargo fmt --all
 ## Status
 
 Pre-1.0 and not published; the API may still change. `lib-vault-posix` is tested on macOS;
-Linux testing is pending. Thread-per-core (`OwnedMode`) support is in the core API, but no
+Linux testing is pending. Thread-per-core (`OwnedBufDriver`) support is in the core API, but no
 backend implements it yet.

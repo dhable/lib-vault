@@ -2,12 +2,12 @@
 //! stores on one root, and between processes.
 
 use futures::{AsyncReadExt, AsyncWriteExt};
-use lib_vault::{Error, Key, Vault, rt::SharedMode};
+use lib_vault::{Error, Key, Vault, io_driver::AsyncIoDriver};
 use lib_vault_posix::{FsClaimer, FsStore, FsStoreOptions};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
-async fn refused(v: &Vault<SharedMode>, k: &str) -> bool {
+async fn refused(v: &Vault<AsyncIoDriver>, k: &str) -> bool {
     match v.claim(Key::new(k).unwrap()).await {
         Err(Error::AlreadyClaimed { key: refused }) => {
             assert_eq!(refused, Key::new(k).unwrap());

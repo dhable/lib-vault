@@ -6,8 +6,8 @@ use crate::root::Root;
 use crate::{FsStoreOptions, PosixError};
 use futures::future::BoxFuture;
 use futures::io::AsyncWrite;
-use lib_vault::rt::SharedMode;
-use lib_vault::rt::shared::{ObjectReader, ObjectWriter};
+use lib_vault::io_driver::AsyncIoDriver;
+use lib_vault::io_driver::async_io::{ObjectReader, ObjectWriter};
 use lib_vault::{Error, Key, Store};
 use rustix::fs::FileType;
 use std::fs::File;
@@ -81,7 +81,7 @@ impl FsStore {
     }
 }
 
-impl Store<SharedMode> for FsStore {
+impl Store<AsyncIoDriver> for FsStore {
     fn list(&self, key: &Key) -> BoxFuture<'_, Result<Vec<Key>, Error>> {
         self.blocking(key, |root, key| {
             list(root, key).map_err(PosixError::into_store_error)

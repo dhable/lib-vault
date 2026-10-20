@@ -48,11 +48,11 @@ pub use store::MemoryStore;
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-use lib_vault::{Key, Vault, rt};
+use lib_vault::{Key, Vault, io_driver};
 use std::io;
 
 /// A `Vault` backed by a new [`MemoryStore`] and [`MemoryClaimer`].
-pub fn vault() -> Vault<rt::SharedMode> {
+pub fn vault() -> Vault<io_driver::AsyncIoDriver> {
     Vault::new(MemoryStore::new(), MemoryClaimer::new())
 }
 

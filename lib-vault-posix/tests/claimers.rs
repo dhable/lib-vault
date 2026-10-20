@@ -2,12 +2,12 @@
 //! distributed claimer. The store must not rely on anything `FsClaimer` does.
 
 use futures::{AsyncReadExt, AsyncWriteExt};
-use lib_vault::{Error, Key, Vault, rt::SharedMode};
+use lib_vault::{Error, Key, Vault, io_driver::AsyncIoDriver};
 use lib_vault_memory::MemoryClaimer;
 use lib_vault_posix::{FsStore, FsStoreOptions};
 use std::path::{Path, PathBuf};
 
-fn memory_claimed_vault() -> (tempfile::TempDir, PathBuf, Vault<SharedMode>) {
+fn memory_claimed_vault() -> (tempfile::TempDir, PathBuf, Vault<AsyncIoDriver>) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("vault");
     let store = FsStore::new(&root, FsStoreOptions::default()).unwrap();

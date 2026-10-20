@@ -18,8 +18,8 @@ store or in-memory store can sit behind the same API (D31). Goals:
 - **Exclusion across applications**: overlapping claims are refused, across processes and, for
   the filesystem backend, across unrelated applications running as different uids/gids (D5).
 - **Runtime-agnostic async**: the API is `async` and the core crate has no runtime dependency,
-  so a backend can target any runtime (D33). Two I/O modes cover work-stealing runtimes
-  (`SharedMode`, `futures` I/O traits, `Send`) and thread-per-core runtimes (`OwnedMode`, owned
+  so a backend can target any runtime (D33). Two I/O drivers cover work-stealing runtimes
+  (`AsyncIoDriver`, `futures` I/O traits, `Send`) and thread-per-core runtimes (`OwnedBufDriver`, owned
   `Bytes` chunks, `!Send`) (D58, D74). Each backend documents its runtime: the memory backend
   needs none, the filesystem backend requires tokio (D56).
 - **Supported platforms** (filesystem backend): Linux ≥ 5.6 and macOS ≥ 15, Rust ≥ 1.89
@@ -46,13 +46,13 @@ Rust code. Security enforcement lives in key validation (§3) and in each backen
 
 | Component | Role |
 |---|---|
-| `Vault<M>` | Cheap-to-clone handle holding the store as `M::StorePtr` (D74), `Arc<dyn Claimer>` and the shared shutdown state `Arc<Mutex<VaultState>>`. Built with `Vault::new(store, claimer)` (D32). `Send + Sync` in `SharedMode`, `!Send` in `OwnedMode`. |
-| `IoMode` (`rt`) | Sealed marker trait choosing the I/O types: `Reader`, `Writer`, future type `Fut`, and `StorePtr`. `SharedMode` and `OwnedMode` (D58, D74). |
+| `Vault<D>` | Cheap-to-clone handle holding the store as `D::StorePtr` (D74), `Arc<dyn Claimer>` and the shared shutdown state `Arc<Mutex<VaultState>>`. Built with `Vault::new(store, claimer)` (D32). `Send + Sync` in `AsyncIoDriver`, `!Send` in `OwnedBufDriver`. |
+| `IoDriver` (`io_driver`) | Open marker trait choosing the I/O types: `Reader`, `Writer`, future type `Fut`, and `StorePtr`. `lib-vault` provides the byte drivers `AsyncIoDriver` and `OwnedBufDriver`; backends may define their own, e.g. typed values for a structured store (D58, D74, D77). |
 | `Claimer` | Strategy for exclusion: `try_lock(key)` makes one attempt and returns a `ClaimLock` or an error; it never waits (D32, D44). Backends: `flock` for the filesystem (§8.3); later a database row lock, a lease, an in-process map. |
 | `ClaimLock` | One held lock. `release()` is synchronous and must not block; each implementation handles its own async work. `Ok` means the key can be claimed again immediately (D39). Called from `Claim::release` or `Claim::drop`. |
-| `Claim<M>` | Exclusive hold on a key and its subtree: the claimed key, the store pointer, the lock and the shared vault state. `list`, `delete`, `open_read`, `open_write` on keys within it, all `&mut self`; keys are resolved against the claimed key (D36). Given up with `release()` (to see errors) or by dropping it. Never `Clone`; `Send` in `SharedMode` only (D37). |
-| `Store<M>` | Storage strategy: `list`, `delete`, `open_read`, `open_write` on full keys, returning `M::Fut` futures. Only `'static`; `Send`/`Sync` come from the mode's store pointer (D74). |
-| `M::Reader<'a>` / `M::Writer<'a>` | Object handles, borrowed from the claim (D38, D42): `AsyncRead`/`AsyncWrite` boxes in `SharedMode`, a `Bytes` stream and an `ObjectWrite` box in `OwnedMode` (§4.3). |
+| `Claim<D>` | Exclusive hold on a key and its subtree: the claimed key, the store pointer, the lock and the shared vault state. `list`, `delete`, `open_read`, `open_write` on keys within it, all `&mut self`; keys are resolved against the claimed key (D36). Given up with `release()` (to see errors) or by dropping it. Never `Clone`; `Send` in `AsyncIoDriver` only (D37). |
+| `Store<D>` | Storage strategy: `list`, `delete`, `open_read`, `open_write` on full keys, returning `D::Fut` futures. Only `'static`; `Send`/`Sync` come from the driver's store pointer (D74). |
+| `D::Reader<'a>` / `D::Writer<'a>` | Object handles, borrowed from the claim (D38, D42): `AsyncRead`/`AsyncWrite` boxes in `AsyncIoDriver`, a `Bytes` stream and an `ObjectWrite` box in `OwnedBufDriver` (§4.3). |
 | `Key` | Canonical, relative, `/`-separated name. `Arc<str>` newtype (§3). |
 
 **Claim flow:**
@@ -138,27 +138,27 @@ never see an optional or empty key. So `claim.delete(None)` deletes the claimed 
 and `claim.list(None)` lists everything in the claim.
 
 ### 4.2 Ownership and threads (D37)
-- **`SharedMode`:** `Claim<SharedMode>` is `Send`: it can be moved to another thread or into a
+- **`AsyncIoDriver`:** `Claim<AsyncIoDriver>` is `Send`: it can be moved to another thread or into a
   spawned task. This is inferred from its fields, not declared (no `unsafe impl`, no
-  `negative-impl`); a compile-time test guards it, along with `Vault<SharedMode>: Send + Sync +
+  `negative-impl`); a compile-time test guards it, along with `Vault<AsyncIoDriver>: Send + Sync +
   Clone` and `Send` `claim()`/`shutdown()` futures.
-- **`OwnedMode`:** `Claim<OwnedMode>` and `Vault<OwnedMode>` hold the store in an `Rc` and are
+- **`OwnedBufDriver`:** `Claim<OwnedBufDriver>` and `Vault<OwnedBufDriver>` hold the store in an `Rc` and are
   deliberately `!Send` (D74): one vault per thread, as thread-per-core runtimes expect.
 - Every operation takes `&mut self`, so only one caller can use a claim at a time. In
-  `SharedMode`, `&mut Claim` is `Send`, so a task that passes a claim to helpers like
-  `async fn work(c: &mut Claim<SharedMode>)` stays spawnable. "Takes `&mut self`" is about
+  `AsyncIoDriver`, `&mut Claim` is `Send`, so a task that passes a claim to helpers like
+  `async fn work(c: &mut Claim<AsyncIoDriver>)` stays spawnable. "Takes `&mut self`" is about
   exclusivity; not every method changes the claim.
 - `Claim` is `!Sync` as a side effect (`dyn ClaimLock` isn't `Sync`). Nothing relies on it: a
   `&Claim` can't do anything.
 - `Claim` never implements `Clone`.
 
-### 4.3 Object handles and I/O modes (D38, D42, D58)
+### 4.3 Object handles and I/O drivers (D38, D42, D58)
 ```rust
-// lib_vault::rt::shared — work-stealing runtimes (tokio, async-std, smol)
+// lib_vault::io_driver::async_io — work-stealing runtimes (tokio, async-std, smol)
 pub type ObjectReader<'a> = Pin<Box<dyn AsyncRead + Send + 'a>>;
 pub type ObjectWriter<'a> = Pin<Box<dyn AsyncWrite + Send + 'a>>;
 
-// lib_vault::rt::owned — thread-per-core, completion-based runtimes (monoio, tokio-uring)
+// lib_vault::io_driver::owned_buf — thread-per-core, completion-based runtimes (monoio, tokio-uring)
 pub type ObjectReader<'a> = LocalBoxStream<'a, Result<Bytes, Error>>;
 pub trait ObjectWrite {
     fn write(&mut self, chunk: Bytes) -> LocalBoxFuture<'_, Result<(), Error>>;
@@ -166,18 +166,18 @@ pub trait ObjectWrite {
 }
 pub type ObjectWriter<'a> = Box<dyn ObjectWrite + 'a>;
 
-impl<M: IoMode> Claim<M> {
-    pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<M::Reader<'a>, Error>;
-    pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<M::Writer<'a>, Error>;
+impl<D: IoDriver> Claim<D> {
+    pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<D::Reader<'a>, Error>;
+    pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<D::Writer<'a>, Error>;
 }
 ```
-- **`SharedMode` handles** borrow the caller's buffer through the `futures` I/O traits. They're
+- **`AsyncIoDriver` handles** borrow the caller's buffer through the `futures` I/O traits. They're
   pinned and boxed so the extension methods (`read_to_end`, `write_all`, …) work whether or not
   a backend's reader is `Unpin`, and `Send` so tasks holding one stay spawnable.
-- **`OwnedMode` handles** pass ownership of `Bytes` chunks, which is what completion-based I/O
+- **`OwnedBufDriver` handles** pass ownership of `Bytes` chunks, which is what completion-based I/O
   needs (the kernel owns the buffer until the operation completes). Nothing is `Send`. The writer
   is a plain `Box` so `close(self: Box<Self>)` can be called; `close()` is the commit point.
-- **The mode is a type parameter**, not a Cargo feature, so both can be used in one build
+- **The driver is a type parameter**, not a Cargo feature, so both can be used in one build
   (D58).
 - **Borrowed from the claim.** A handle borrows `&mut Claim`, so the claim can't be released or
   dropped while a handle is alive (`drop(c)` with a live reader is a compile error, E0505).
@@ -265,18 +265,20 @@ several callers, refused claims).
 ## 5. Store contract
 
 ```rust
-pub trait Store<M: IoMode>: 'static {
-    fn list(&self, key: &Key) -> M::Fut<'_, Result<Vec<Key>, Error>>;
-    fn delete<'a>(&'a self, key: &Key) -> M::Fut<'a, Result<(), Error>>;
-    fn open_read<'a>(&'a self, key: &Key) -> M::Fut<'a, Result<M::Reader<'a>, Error>>;
-    fn open_write<'a>(&'a self, key: &Key) -> M::Fut<'a, Result<M::Writer<'a>, Error>>;
+pub trait Store<D: IoDriver>: 'static {
+    fn list(&self, key: &Key) -> D::Fut<'_, Result<Vec<Key>, Error>>;
+    fn delete<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<(), Error>>;
+    fn open_read<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<D::Reader<'a>, Error>>;
+    fn open_write<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<D::Writer<'a>, Error>>;
 }
 ```
-**Thread-safety comes from the mode, not the trait** (D74): `Store` has no `Send`/`Sync`
-supertraits, so an `OwnedMode` store can hold `!Send` runtime state. The mode's `StorePtr` adds
-them where needed: a `Vault<SharedMode>` holds `Arc<dyn Store<SharedMode> + Send + Sync>`, a
-`Vault<OwnedMode>` holds `Rc<dyn Store<OwnedMode>>`. `Vault::new` takes `impl IntoStorePtr<M>`,
-implemented for every store that meets the mode's bounds.
+**Thread-safety comes from the driver, not the trait** (D74): `Store` has no `Send`/`Sync`
+supertraits, so an `OwnedBufDriver` store can hold `!Send` runtime state. The driver's `StorePtr` adds
+them where needed: a `Vault<AsyncIoDriver>` holds `Arc<dyn Store<AsyncIoDriver> + Send + Sync>`, a
+`Vault<OwnedBufDriver>` holds `Rc<dyn Store<OwnedBufDriver>>`. `Vault::new<S>(store: S, claimer)` requires `D: IntoStorePtr<S>`, which each driver implements
+for every store that meets its bounds. The driver is the implementing type
+(`impl<S> IntoStorePtr<S> for MyDriver`) so drivers outside `lib-vault` can implement it; the
+reverse, `impl<S> IntoStorePtr<MyDriver> for S`, breaks the orphan rule (D77).
 
 Every key a `Store` receives is a full key that already satisfies the name policy and caps
 (§3); `Claim` resolves its optional, claim-relative keys before calling the store (D48).
@@ -334,10 +336,10 @@ These are documented on the traits in `lib-vault/src/claimer.rs`:
 - **`ClaimLock::release`** is synchronous and non-blocking; the implementation handles any
   async work itself. It returns `Ok` only once the key can be claimed again immediately (D39,
   §4.4). It's called from `Claim::release` or `Claim::drop`.
-- **Not mode-specific:** `Claimer: Send + Sync`, `try_lock` returns `BoxFuture`, and
-  `ClaimLock: Send`, in both I/O modes. An owned-mode backend's claimer therefore can't do
+- **Not driver-specific:** `Claimer: Send + Sync`, `try_lock` returns `BoxFuture`, and
+  `ClaimLock: Send`, in both I/O drivers. An owned-buffer backend's claimer therefore can't do
   runtime I/O while locking; it must lock without the runtime (as `flock` does). Making the
-  claimer traits mode-generic is open (P50).
+  claimer traits driver-generic is open (P50).
 
 ## 7. Public API
 
@@ -370,49 +372,49 @@ pub const MAX_COMPONENT_LEN: usize = 255;
 pub const MAX_DEPTH: usize = 32;
 pub const MAX_KEY_LEN: usize = 1024;
 
-pub mod rt {
-    pub trait IoMode: Sealed + Sized + 'static {
+pub mod io_driver {
+    pub trait IoDriver: Sized + 'static {                     // open: backends may add drivers (D77)
         type Reader<'a>;
         type Writer<'a>;
         type Fut<'a, T: 'a>: Future<Output = T> + 'a;
         type StorePtr: Clone + Deref<Target: Store<Self>>;     // D74
     }
-    pub trait IntoStorePtr<M: IoMode> { fn into_store_ptr(self) -> M::StorePtr; }
-    pub struct SharedMode;   // BoxFuture, AsyncRead/AsyncWrite, Arc<dyn Store<_> + Send + Sync>
-    pub struct OwnedMode;    // LocalBoxFuture, Bytes stream / ObjectWrite, Rc<dyn Store<_>>
-    pub mod shared { /* ObjectReader, ObjectWriter (§4.3) */ }
-    pub mod owned  { /* ObjectReader, ObjectWrite, ObjectWriter (§4.3) */ }
+    pub trait IntoStorePtr<S>: IoDriver { fn into_store_ptr(store: S) -> Self::StorePtr; }
+    pub struct AsyncIoDriver;    // BoxFuture, AsyncRead/AsyncWrite, Arc<dyn Store<_> + Send + Sync>
+    pub struct OwnedBufDriver;   // LocalBoxFuture, Bytes stream / ObjectWrite, Rc<dyn Store<_>>
+    pub mod async_io  { /* ObjectReader, ObjectWriter (§4.3) */ }
+    pub mod owned_buf { /* ObjectReader, ObjectWrite, ObjectWriter (§4.3) */ }
 }
 
-pub struct Vault<M: IoMode> { store: M::StorePtr, claimer: Arc<dyn Claimer>, state: Arc<Mutex<VaultState>> }
-impl<M: IoMode> Clone for Vault<M> { /* by hand: no `M: Clone` bound */ }
-impl<M: IoMode> Vault<M> {
-    pub fn new(store: impl IntoStorePtr<M>, claimer: impl Claimer) -> Self;
-    pub async fn claim(&self, key: Key) -> Result<Claim<M>, Error>;
+pub struct Vault<D: IoDriver> { store: D::StorePtr, claimer: Arc<dyn Claimer>, state: Arc<Mutex<VaultState>> }
+impl<D: IoDriver> Clone for Vault<D> { /* by hand: no `D: Clone` bound */ }
+impl<D: IoDriver> Vault<D> {
+    pub fn new<S: Store<D>>(store: S, claimer: impl Claimer) -> Self where D: IntoStorePtr<S>;
+    pub async fn claim(&self, key: Key) -> Result<Claim<D>, Error>;
     pub async fn shutdown(self);
 }
 
 pub trait AsKeyRef { fn into_key(self) -> Result<Option<Key>, KeyError>; }
 // implemented for &str (validated), &Key, Option<&Key>
 
-pub struct Claim<M: IoMode> { base: Key, store: M::StorePtr, lock: Option<Box<dyn ClaimLock>>, state: Arc<Mutex<VaultState>> }
-impl<M: IoMode> Claim<M> {                                // never Clone; Send in SharedMode
+pub struct Claim<D: IoDriver> { base: Key, store: D::StorePtr, lock: Option<Box<dyn ClaimLock>>, state: Arc<Mutex<VaultState>> }
+impl<D: IoDriver> Claim<D> {                                // never Clone; Send in AsyncIoDriver
     // key: "a/b", &key, or None (= the claimed key itself) (D48)
     pub async fn list(&mut self, prefix: impl AsKeyRef) -> Result<Vec<Key>, Error>;
     pub async fn delete(&mut self, key: impl AsKeyRef) -> Result<(), Error>;
-    pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<M::Reader<'a>, Error>;
-    pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<M::Writer<'a>, Error>;
+    pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<D::Reader<'a>, Error>;
+    pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<D::Writer<'a>, Error>;
     pub fn release(self) -> Result<(), Error>;
 }
 impl Drop for Claim { /* self.release() (errors logged), then count down */ }
 
 pub trait ClaimLock { /* §6 */ }
 pub trait Claimer { /* §6 */ }
-pub trait Store<M: IoMode> { /* §5 */ }
+pub trait Store<D: IoDriver> { /* §5 */ }
 ```
 
-**Async style** (D33): inherent methods are `async fn`; `Store` methods return the mode's
-`M::Fut` (`BoxFuture` or `LocalBoxFuture`), `Claimer::try_lock` returns `BoxFuture`. A
+**Async style** (D33): inherent methods are `async fn`; `Store` methods return the driver's
+`D::Fut` (`BoxFuture` or `LocalBoxFuture`), `Claimer::try_lock` returns `BoxFuture`. A
 trait using `async fn` can't be used as `dyn Trait` and can't promise its futures are `Send`.
 An `async fn`'s `Send`-ness is inferred, so it can be lost silently (as the v6 `claim`, which
 held a `MutexGuard` across `.await`, showed); §13 asserts it.
@@ -420,11 +422,12 @@ held a `MutexGuard` across `.await`, showed); §13 asserts it.
 **Build status:** the workspace builds and 103 tests pass (`lib-vault`: 17 unit + 1 doc;
 `lib-vault-memory`: 41 integration + 4 doc; `lib-vault-posix`: 1 unit + 37 integration + 2 doc;
 the doc counts include each crate's README examples),
-including the compile-time `Send` checks for `SharedMode`; clippy and `cargo doc` are clean; the
+including the compile-time `Send` checks for `AsyncIoDriver`; clippy and `cargo doc` are clean; the
 `Claim::list` example is `ignore`d. Known leftovers: a stale `REVIEW(nit)` comment above the
 `try_lock` docs, and some doc-comment typos.
 
-**History.** v10 replaced the single handle pair with I/O modes (`rt`, D58), removed
+**History.** v10 replaced the single handle pair with I/O modes (`rt`, D58; renamed to I/O
+drivers in `io_driver`, unsealed, by D77), removed
 `ScopedStore` (claims resolve keys themselves, D36), and moved `Send`/`Sync` from `Store` to the
 mode's `StorePtr` (D74). v9 made `ClaimLock::release` synchronous (it was a `BoxFuture` run with `block_on`
 in `Drop` in v6–v8) and made `Claim::release` a sync method; it briefly took `&mut self`,
@@ -437,7 +440,7 @@ Since v3: `Vault::new(root)` / `new_shared`, `shutdown_timeout`, `Claim<'a>` lif
 ## 8. Filesystem backend (`FsStore` + `FsClaimer`)
 
 The first backend, implemented in `lib-vault-posix` (D73): `FsStore` implements
-`Store<SharedMode>`, and `FsClaimer` is the claimer built for it (D45, D75). It requires the app
+`Store<AsyncIoDriver>`, and `FsClaimer` is the claimer built for it (D45, D75). It requires the app
 to run on a tokio runtime (D56). `FsStore` works with any claimer (it creates its own
 directories and never touches lock files); `FsClaimer` works only with an `FsStore`
 (`FsClaimer::new(&store)`). §8.3 describes `FsClaimer`; with another claimer, no lock files
@@ -593,15 +596,15 @@ Deployment guide (documentation):
 ## 11. Async notes
 
 Async is the base API (D33), not a later addition. Notes carried over from the old v2 plan:
-- `Store` methods return the mode's future (`BoxFuture` in `SharedMode`, `LocalBoxFuture` in
-  `OwnedMode`); `Claimer::try_lock` returns `BoxFuture`; inherent methods are `async fn` (§7).
-  `SharedMode` handles use the `futures` I/O traits (tokio users adapt with
-  `tokio_util::compat`); `OwnedMode` handles pass owned `Bytes` chunks (§4.3).
-- **`Send` futures (`SharedMode`)**: claim methods take `&mut self`, so using a claim keeps
+- `Store` methods return the driver's future (`BoxFuture` in `AsyncIoDriver`, `LocalBoxFuture` in
+  `OwnedBufDriver`); `Claimer::try_lock` returns `BoxFuture`; inherent methods are `async fn` (§7).
+  `AsyncIoDriver` handles use the `futures` I/O traits (tokio users adapt with
+  `tokio_util::compat`); `OwnedBufDriver` handles pass owned `Bytes` chunks (§4.3).
+- **`Send` futures (`AsyncIoDriver`)**: claim methods take `&mut self`, so using a claim keeps
   futures `Send` (§4.2), readers/writers are `Send` (§4.3), and so are the `claim()` and
-  `shutdown()` futures. In `OwnedMode` none of this is `Send`, by design (D74).
-- **Which runtimes fit**: work-stealing runtimes use `SharedMode`; thread-per-core runtimes use
-  `OwnedMode` for stores, but their claimers must still lock without runtime I/O (P50).
+  `shutdown()` futures. In `OwnedBufDriver` none of this is `Send`, by design (D74).
+- **Which runtimes fit**: work-stealing runtimes use `AsyncIoDriver`; thread-per-core runtimes use
+  `OwnedBufDriver` for stores, but their claimers must still lock without runtime I/O (P50).
 - **No async in `release` or `Drop`**: `ClaimLock::release` is synchronous and must not block;
   a lock that needs async I/O to release runs it on its own thread or runtime (D39, §4.4).
 - **Flush before unlock**: a backend whose writes complete in the background (e.g. a thread
@@ -623,8 +626,8 @@ root.
 
 | Crate | Contents |
 |---|---|
-| `lib-vault` | the core API: `Vault<M>`, `Claim<M>`, `Key`, the `Store<M>` / `Claimer` / `ClaimLock` traits, the I/O modes in `rt`, `Error` |
-| `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<SharedMode>`, any claimer), `FsClaimer` (`FsStore` only), `FsStoreOptions`, `Sharing`, `PosixError`; requires a tokio runtime (D56) |
+| `lib-vault` | the core API: `Vault<D>`, `Claim<D>`, `Key`, the `Store<D>` / `Claimer` / `ClaimLock` traits, the I/O drivers in `io_driver`, `Error` |
+| `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<AsyncIoDriver>`, any claimer), `FsClaimer` (`FsStore` only), `FsStoreOptions`, `Sharing`, `PosixError`; requires a tokio runtime (D56) |
 | `lib-vault-memory` | the in-memory backend for tests and getting started (D51): `MemoryStore`, `MemoryClaimer`, `vault()`; integration tests in `tests/` exercise the core API against it |
 
 Modules in `lib-vault/src/`:
@@ -636,8 +639,8 @@ Modules in `lib-vault/src/`:
 | `key.rs` | `Key`, `KeyError` |
 | `vault.rs` | `Vault`, `VaultState` (shutdown flag, outstanding count, waiters) |
 | `claim.rs` | `Claim`, release / `Drop` |
-| `store.rs` | `Store<M>` |
-| `rt/` | `IoMode`, `IntoStorePtr`; `shared.rs` (`SharedMode`, `AsyncRead`/`AsyncWrite` handles), `owned.rs` (`OwnedMode`, `Bytes` stream, `ObjectWrite`) |
+| `store.rs` | `Store<D>` |
+| `io_driver/` | `IoDriver`, `IntoStorePtr`; `async_io.rs` (`AsyncIoDriver`, `AsyncRead`/`AsyncWrite` handles), `owned_buf.rs` (`OwnedBufDriver`, `Bytes` stream, `ObjectWrite`) |
 | `claimer.rs` | `Claimer`, `ClaimLock` |
 
 Modules in `lib-vault-posix/src/`:
@@ -663,11 +666,11 @@ It depends on `rustix` (D52) and tokio (D56); neither is a dependency of the oth
   reserved names in any case, `.vault`), the caps at and just over their limits, `join`
   failing with `TooDeep`/`TooLong`, join associativity, join always nests, component-wise
   `starts_with`/`strip_prefix`, `parent`/`object_name`, parse/display round trip.
-- **Compile-time checks** (done for `SharedMode`): `Claim<SharedMode>: Send`,
-  `Vault<SharedMode>: Send + Sync + Clone`, and `Send` futures from `Vault::claim` and
+- **Compile-time checks** (done for `AsyncIoDriver`): `Claim<AsyncIoDriver>: Send`,
+  `Vault<AsyncIoDriver>: Send + Sync + Clone`, and `Send` futures from `Vault::claim` and
   `Vault::shutdown`; `claim.release()` with a live reader doesn't compile (a `compile_fail`
-  doctest in `lib-vault-memory`). To add: a test that an `OwnedMode` store holding `!Send`
-  state works through `Vault<OwnedMode>`.
+  doctest in `lib-vault-memory`). To add: a test that an `OwnedBufDriver` store holding `!Send`
+  state works through `Vault<OwnedBufDriver>`.
 - **Core, against an in-memory backend**: scoped claims can't reach outside their key (D36);
   overlapping claims conflict in both directions and disjoint ones don't (D44);
   `ClaimLock::release` runs exactly once whether the claim is released, dropped, or both, and

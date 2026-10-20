@@ -1,4 +1,4 @@
-use crate::rt::{self, IntoStorePtr};
+use crate::io_driver::{self, IntoStorePtr};
 use crate::{Claim, Claimer, Error, Key, Store};
 use std::future;
 use std::sync::{Arc, Mutex};
@@ -15,21 +15,21 @@ pub(crate) struct VaultState {
 
 /// The Vault is the entry point to setting up storage and a locking strategy for
 /// working with long lived data.
-pub struct Vault<M: rt::IoMode> {
-    store: M::StorePtr,
+pub struct Vault<D: io_driver::IoDriver> {
+    store: D::StorePtr,
     claimer: Arc<dyn Claimer>,
     state: Arc<Mutex<VaultState>>,
 }
 
-impl<M: rt::IoMode> Vault<M> {
+impl<D: io_driver::IoDriver> Vault<D> {
     /// Creates a new Vault given an implementation of a storage engine `store` and
     /// a claim locking engine `claimer`.
-    pub fn new<S: Store<M>>(store: S, claimer: impl Claimer) -> Self
+    pub fn new<S: Store<D>>(store: S, claimer: impl Claimer) -> Self
     where
-        M: IntoStorePtr<S>,
+        D: IntoStorePtr<S>,
     {
         Self {
-            store: M::into_store_ptr(store),
+            store: D::into_store_ptr(store),
             claimer: Arc::new(claimer),
             state: Arc::new(Mutex::new(Default::default())),
         }
@@ -39,7 +39,7 @@ impl<M: rt::IoMode> Vault<M> {
     /// object path asychronously. This can result in either a valid `Claim` object, which
     /// provides exclusive access to the path and it's subpaths. Can result in an error
     /// if a claim cannot be obtained.
-    pub async fn claim(&self, key: Key) -> Result<Claim<M>, Error> {
+    pub async fn claim(&self, key: Key) -> Result<Claim<D>, Error> {
         let mut claim = {
             // Do all the state updates and drop the guard before an await boundry. This also
             // avoids a possible deadlock on a single threaded execution pool.
@@ -81,10 +81,10 @@ impl<M: rt::IoMode> Vault<M> {
     }
 }
 
-// The `IoMode` type parameter doesn't need to implement `Clone` since it's
+// The `IoDriver` type parameter doesn't need to implement `Clone` since it's
 // just a method of passing bundled type information around. The derive macro
 // doesn't know that exception so a verbose `Clone` implementation is required.
-impl<M: rt::IoMode> Clone for Vault<M> {
+impl<D: io_driver::IoDriver> Clone for Vault<D> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
@@ -97,7 +97,7 @@ impl<M: rt::IoMode> Clone for Vault<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rt::shared::{ObjectReader, ObjectWriter};
+    use crate::io_driver::async_io::{ObjectReader, ObjectWriter};
     use crate::{ClaimLock, Store};
     use futures::FutureExt;
     use futures::future::{self, BoxFuture};
@@ -106,7 +106,7 @@ mod tests {
     // A store the claim never uses in these tests.
     struct NullStore;
 
-    impl Store<rt::SharedMode> for NullStore {
+    impl Store<io_driver::AsyncIoDriver> for NullStore {
         fn list(&self, _: &Key) -> BoxFuture<'_, Result<Vec<Key>, Error>> {
             Box::pin(future::ready(Ok(Vec::new())))
         }
@@ -161,7 +161,7 @@ mod tests {
         }
     }
 
-    fn counting_vault(fail: bool) -> (Vault<rt::SharedMode>, Arc<AtomicUsize>) {
+    fn counting_vault(fail: bool) -> (Vault<io_driver::AsyncIoDriver>, Arc<AtomicUsize>) {
         let releases = Arc::new(AtomicUsize::new(0));
         let claimer = CountingClaimer {
             releases: releases.clone(),
@@ -170,7 +170,7 @@ mod tests {
         (Vault::new(NullStore, claimer), releases)
     }
 
-    fn claim<M: rt::IoMode>(vault: &Vault<M>) -> Claim<M> {
+    fn claim<D: io_driver::IoDriver>(vault: &Vault<D>) -> Claim<D> {
         let key = Key::new("a").unwrap();
         vault.claim(key).now_or_never().unwrap().unwrap()
     }
