@@ -1,5 +1,5 @@
 use crate::rt::{self, IntoStorePtr};
-use crate::{Claim, Claimer, Error, Key};
+use crate::{Claim, Claimer, Error, Key, Store};
 use std::future;
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
@@ -24,9 +24,12 @@ pub struct Vault<M: rt::IoMode> {
 impl<M: rt::IoMode> Vault<M> {
     /// Creates a new Vault given an implementation of a storage engine `store` and
     /// a claim locking engine `claimer`.
-    pub fn new(store: impl IntoStorePtr<M>, claimer: impl Claimer) -> Self {
+    pub fn new<S: Store<M>>(store: S, claimer: impl Claimer) -> Self
+    where
+        M: IntoStorePtr<S>,
+    {
         Self {
-            store: store.into_store_ptr(),
+            store: M::into_store_ptr(store),
             claimer: Arc::new(claimer),
             state: Arc::new(Mutex::new(Default::default())),
         }

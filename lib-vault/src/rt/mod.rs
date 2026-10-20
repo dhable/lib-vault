@@ -23,8 +23,8 @@ pub trait IoMode: Sized + 'static {
 
 /// Trait that can turn a `Store` instance into a `IoMode::StorePtr` based
 /// on the individual `IoMode` types.
-pub trait IntoStorePtr<M: IoMode> {
-    fn into_store_ptr(self) -> M::StorePtr;
+pub trait IntoStorePtr<S>: IoMode {
+    fn into_store_ptr(store: S) -> Self::StorePtr;
 }
 
 pub use owned::OwnedMode;

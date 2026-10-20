@@ -26,8 +26,8 @@ impl IoMode for OwnedMode {
     type StorePtr = Rc<dyn Store<OwnedMode>>;
 }
 
-impl<S: Store<OwnedMode>> IntoStorePtr<OwnedMode> for S {
-    fn into_store_ptr(self) -> <OwnedMode as IoMode>::StorePtr {
-        Rc::new(self)
+impl<S: Store<OwnedMode>> IntoStorePtr<S> for OwnedMode {
+    fn into_store_ptr(store: S) -> Self::StorePtr {
+        Rc::new(store)
     }
 }

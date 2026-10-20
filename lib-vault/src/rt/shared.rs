@@ -25,8 +25,8 @@ impl IoMode for SharedMode {
     type StorePtr = Arc<dyn Store<SharedMode> + Send + Sync>;
 }
 
-impl<S: Store<SharedMode> + Send + Sync> IntoStorePtr<SharedMode> for S {
-    fn into_store_ptr(self) -> <SharedMode as IoMode>::StorePtr {
-        Arc::new(self)
+impl<S: Store<SharedMode> + Send + Sync> IntoStorePtr<S> for SharedMode {
+    fn into_store_ptr(store: S) -> Self::StorePtr {
+        Arc::new(store)
     }
 }
