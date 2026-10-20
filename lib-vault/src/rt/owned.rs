@@ -1,7 +1,7 @@
 //! Defines a series of I/O types for runtimes that operate on moving owned buffers
 //! around. These runtimes normally assign a thread to a specific core and threads
 //! do not pull pending work or reassign work to other threads.
-use super::{IntoStorePtr, IoMode, private};
+use super::{IntoStorePtr, IoMode};
 use crate::{Error, Store};
 use bytes::Bytes;
 use futures::future::LocalBoxFuture;
@@ -18,7 +18,6 @@ pub trait ObjectWrite {
 pub type ObjectWriter<'a> = Box<dyn ObjectWrite + 'a>;
 
 pub struct OwnedMode;
-impl private::Sealed for OwnedMode {}
 
 impl IoMode for OwnedMode {
     type Fut<'a, T: 'a> = LocalBoxFuture<'a, T>;

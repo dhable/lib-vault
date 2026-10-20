@@ -5,16 +5,9 @@ use std::ops::Deref;
 pub mod owned;
 pub mod shared;
 
-mod private {
-    // Exposed in a module that can only be accessed from this module and its children
-    // through the `super::` construct. This prevents outside code from the core library
-    // from extending the `IoMode`.
-    pub trait Sealed {}
-}
-
 /// Trait used solely as a container for bundling a series of types used in the core
 /// library without binding tightly to a specific implementation.
-pub trait IoMode: private::Sealed + Sized + 'static {
+pub trait IoMode: Sized + 'static {
     /// The type to use for reading data from a vault object.
     type Reader<'a>;
 
