@@ -1,4 +1,5 @@
-use crate::{AsKeyRef, ClaimLock, Error, Key, KeyError, Store, VaultState, io_driver};
+use crate::{AsKeyRef, ClaimLock, Error, Key, Store, VaultState, io_driver};
+use futures::future::{self, Either};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
@@ -49,29 +50,38 @@ impl<D: io_driver::IoDriver> Claim<D> {
     /// ```
     /// Would list all the objects that have keys that are children of `top/parent`.
     /// `None` lists everything in the claim.
-    pub async fn list(&mut self, prefix: impl AsKeyRef) -> Result<Vec<Key>, Error> {
-        let prefix = prefix.into_key()?;
-        let resolved_key = resolve_key(&self.base, prefix.as_ref())?;
-        self.store.list(&resolved_key).await
+    pub fn list(
+        &mut self,
+        prefix: impl AsKeyRef,
+    ) -> impl Future<Output = Result<Vec<Key>, Error>> + '_ {
+        match resolve_key(&self.base, prefix) {
+            Ok(key) => Either::Left(self.store.list(&key)),
+            Err(err) => Either::Right(future::ready(Err(err))),
+        }
     }
 
     /// Deletes a specific object stored at `base` + `key`. Calling this method with a
     /// key that does not exist in the store is considered a successful delete operation.
     /// This behavior matches the semantics of the HTTP DELETE method.
     /// `None` means the claimed key itself.
-    pub async fn delete(&mut self, key: impl AsKeyRef) -> Result<(), Error> {
-        let key = key.into_key()?;
-        let resolved_key = resolve_key(&self.base, key.as_ref())?;
-        self.store.delete(&resolved_key).await
+    pub fn delete(&mut self, key: impl AsKeyRef) -> impl Future<Output = Result<(), Error>> + '_ {
+        match resolve_key(&self.base, key) {
+            Ok(key) => Either::Left(self.store.delete(&key)),
+            Err(err) => Either::Right(future::ready(Err(err))),
+        }
     }
 
     /// Opens a specific object at `base` + `key` for reading. The resulting reader is valid
     /// for the duration of the claim. Reading a key that does not point an object will return
     /// an error. `None` means the claimed key itself.
-    pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<D::Reader<'a>, Error> {
-        let key = key.into_key()?;
-        let resolved_key = resolve_key(&self.base, key.as_ref())?;
-        self.store.open_read(&resolved_key).await
+    pub fn open_read<'a>(
+        &'a mut self,
+        key: impl AsKeyRef,
+    ) -> impl Future<Output = Result<D::Reader<'a>, Error>> + 'a {
+        match resolve_key(&self.base, key) {
+            Ok(key) => Either::Left(self.store.open_read(&key)),
+            Err(err) => Either::Right(future::ready(Err(err))),
+        }
     }
 
     /// Opens a specific object at `base` + `key` for writing. The specific beahviors around when
@@ -82,10 +92,14 @@ impl<D: io_driver::IoDriver> Claim<D> {
     /// Writing to a key pointing at an existing object should overwrite the exiting object data.
     /// Writing to a key that does not have an object will create the object with the given key.
     /// `None` means the claimed key itself.
-    pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<D::Writer<'a>, Error> {
-        let key = key.into_key()?;
-        let resolved_key = resolve_key(&self.base, key.as_ref())?;
-        self.store.open_write(&resolved_key).await
+    pub fn open_write<'a>(
+        &'a mut self,
+        key: impl AsKeyRef,
+    ) -> impl Future<Output = Result<D::Writer<'a>, Error>> + 'a {
+        match resolve_key(&self.base, key) {
+            Ok(key) => Either::Left(self.store.open_write(&key)),
+            Err(err) => Either::Right(future::ready(Err(err))),
+        }
     }
 
     /// Releases the underyling Claim lock issued when the Claim was created. Use the
@@ -97,8 +111,11 @@ impl<D: io_driver::IoDriver> Claim<D> {
 }
 
 // The full key for an optional key relative to `base`; `None` is `base` itself.
-fn resolve_key(base: &Key, key: Option<&Key>) -> Result<Key, KeyError> {
-    key.map_or_else(|| Ok(base.clone()), |k| base.join(k))
+fn resolve_key(base: &Key, key: impl AsKeyRef) -> Result<Key, Error> {
+    let key = key.into_key()?;
+    key.as_ref()
+        .map_or_else(|| Ok(base.clone()), |k| base.join(k))
+        .map_err(Error::Key)
 }
 
 // Helper function that implements the resuable logic around taking the lock from
@@ -165,6 +182,23 @@ mod tests {
                 assert_send_value(&vault.shutdown());
             }
             let _ = futures_are_send;
+
+            // A task that awaits every claim operation must be spawnable: the same
+            // `Send + 'static` bound as `tokio::spawn`, checked for all lifetimes. A borrow
+            // held across an `.await` inside these methods breaks this even when each future
+            // is `Send` on its own.
+            fn spawnable<F: Future + Send + 'static>(_: F) {}
+            fn claim_futures_are_spawnable(vault: Vault<AsyncIoDriver>) {
+                spawnable(async move {
+                    let k = Key::new("k").unwrap();
+                    let mut c = vault.claim(Key::new("a").unwrap()).await.unwrap();
+                    let _ = c.list(None).await;
+                    let _ = c.delete("x").await;
+                    drop(c.open_read(&k).await);
+                    drop(c.open_write(Some(&k)).await);
+                });
+            }
+            let _ = claim_futures_are_spawnable;
         }
     }
 }
