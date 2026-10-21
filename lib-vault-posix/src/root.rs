@@ -108,11 +108,13 @@ impl Root {
         if created {
             apply_sharing(&fd, options.sharing, &path)?;
         }
-        check_sharing(&fd, options.sharing, &path)?;
-
+        // ACLs before the mode: on Linux an ACL entry also sets the group bits to the ACL
+        // mask (a `0700` root reads as `0750`), so checking the mode first would report a
+        // wrong mode instead of the ACL that caused it.
         if crate::acl::has_extended_acl(fd.as_fd()).map_err(|e| PosixError::io(&path, e))? {
             return Err(PosixError::ExtendedAcl { path });
         }
+        check_sharing(&fd, options.sharing, &path)?;
         warn_if_not_local(&fd, &path);
         if options.strict_modes {
             check_strict_modes(&parent)?;

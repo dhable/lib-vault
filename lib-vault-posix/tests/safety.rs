@@ -154,7 +154,8 @@ fn a_new_root_is_created_with_the_sharing_mode() {
         0o700
     );
 
-    let gid = rustix_gid();
+    // The effective gid: a group the process can always give its own files.
+    let gid = rustix::process::getegid().as_raw();
     let shared = dir.path().join("shared");
     FsStore::new(
         &shared,
@@ -166,14 +167,6 @@ fn a_new_root_is_created_with_the_sharing_mode() {
     // Reopening in private mode is refused: the root is shared.
     let err = root_error(&shared, FsStoreOptions::default());
     assert!(matches!(err, PosixError::InvalidRoot { .. }), "{err}");
-}
-
-fn rustix_gid() -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    // The temp directory's group is one the current user can use.
-    std::fs::metadata(std::env::temp_dir())
-        .map(|m| m.gid())
-        .unwrap_or(0)
 }
 
 #[test]
