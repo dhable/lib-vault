@@ -1,0 +1,86 @@
+# Standard Rust checks on every push to `main` or any other branch (D81).
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded runs on feature branches are cancelled; every `main` commit is checked.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    # Both platforms: lib-vault-posix has Linux-only and Apple-only code.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          # lib-vault-posix is Unix-only (`std::os::unix`); Windows checks every other crate.
+          - os: windows-latest
+            exclude: --exclude lib-vault-posix
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets --locked ${{ matrix.exclude }}
+      # Unit, integration and doc tests.
+      - run: cargo test --workspace --locked ${{ matrix.exclude }}
+
+  msrv:
+    name: msrv (${{ matrix.toolchain }})
+    # Libraries only: the MSRV is about what users compile, not the dev-dependencies.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: "1.89"
+            packages: -p lib-vault -p lib-vault-memory -p lib-vault-posix
+          # sqlx 0.9 requires Rust 1.94.
+          - toolchain: "1.94"
+            packages: -p lib-vault-sqlite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ matrix.toolchain }}
+      - run: cargo build --locked ${{ matrix.packages }}
