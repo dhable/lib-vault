@@ -2,11 +2,19 @@
 name = "lib-vault-sqlite"
 version.workspace = true
 edition.workspace = true
-description = "SQLite lib-vault backend storing typed values (API sketch)"
+description = "SQLite lib-vault backend storing typed values"
 readme = "README.md"
 
 [dependencies]
 lib-vault.workspace = true
 futures.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 sqlx.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process"] }
+futures = { workspace = true, features = ["executor"] }
+tempfile.workspace = true
+lib-vault-memory.workspace = true

@@ -522,8 +522,12 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "lib-vault",
+ "lib-vault-memory",
  "sqlx",
+ "tempfile",
  "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

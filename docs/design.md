@@ -1,7 +1,8 @@
 # lib-vault — Design
 
-Status: the core API (`lib-vault`, sketch v10) and two backends are implemented:
-`lib-vault-memory` (D51) and `lib-vault-posix` (D73, tested on macOS, not yet on Linux). The code
+Status: the core API (`lib-vault`, sketch v10) and three backends are implemented:
+`lib-vault-memory` (D51), `lib-vault-posix` (D73, tested on macOS, not yet on Linux) and
+`lib-vault-sqlite` (D78, D79, typed values). The code
 is the source of truth. Decision log and open questions: [`decisions.md`](decisions.md).
 
 ## Purpose
@@ -167,8 +168,9 @@ pub trait ObjectWrite {
 pub type ObjectWriter<'a> = Box<dyn ObjectWrite + 'a>;
 
 impl<D: IoDriver> Claim<D> {
-    pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<D::Reader<'a>, Error>;
-    pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<D::Writer<'a>, Error>;
+    // `impl Future` rather than `async fn`, so tasks awaiting them can be spawned (D80).
+    pub fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> impl Future<Output = Result<D::Reader<'a>, Error>> + 'a;
+    pub fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> impl Future<Output = Result<D::Writer<'a>, Error>> + 'a;
 }
 ```
 - **`AsyncIoDriver` handles** borrow the caller's buffer through the `futures` I/O traits. They're
@@ -400,10 +402,12 @@ pub trait AsKeyRef { fn into_key(self) -> Result<Option<Key>, KeyError>; }
 pub struct Claim<D: IoDriver> { base: Key, store: D::StorePtr, lock: Option<Box<dyn ClaimLock>>, state: Arc<Mutex<VaultState>> }
 impl<D: IoDriver> Claim<D> {                                // never Clone; Send in AsyncIoDriver
     // key: "a/b", &key, or None (= the claimed key itself) (D48)
-    pub async fn list(&mut self, prefix: impl AsKeyRef) -> Result<Vec<Key>, Error>;
-    pub async fn delete(&mut self, key: impl AsKeyRef) -> Result<(), Error>;
-    pub async fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> Result<D::Reader<'a>, Error>;
-    pub async fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> Result<D::Writer<'a>, Error>;
+    // `impl Future`, not `async fn` (D80): the key is resolved when called, its error
+    // delivered when awaited
+    pub fn list(&mut self, prefix: impl AsKeyRef) -> impl Future<Output = Result<Vec<Key>, Error>> + '_;
+    pub fn delete(&mut self, key: impl AsKeyRef) -> impl Future<Output = Result<(), Error>> + '_;
+    pub fn open_read<'a>(&'a mut self, key: impl AsKeyRef) -> impl Future<Output = Result<D::Reader<'a>, Error>> + 'a;
+    pub fn open_write<'a>(&'a mut self, key: impl AsKeyRef) -> impl Future<Output = Result<D::Writer<'a>, Error>> + 'a;
     pub fn release(self) -> Result<(), Error>;
 }
 impl Drop for Claim { /* self.release() (errors logged), then count down */ }
@@ -413,7 +417,9 @@ pub trait Claimer { /* §6 */ }
 pub trait Store<D: IoDriver> { /* §5 */ }
 ```
 
-**Async style** (D33): inherent methods are `async fn`; `Store` methods return the driver's
+**Async style** (D33, D80): `Vault::claim` and `Vault::shutdown` are `async fn`; `Claim`'s
+object methods return `impl Future` without an `async` state machine (an `async fn` there
+made tasks awaiting it unspawnable); `Store` methods return the driver's
 `D::Fut` (`BoxFuture` or `LocalBoxFuture`), `Claimer::try_lock` returns `BoxFuture`. A
 trait using `async fn` can't be used as `dyn Trait` and can't promise its futures are `Send`.
 An `async fn`'s `Send`-ness is inferred, so it can be lost silently (as the v6 `claim`, which
@@ -597,12 +603,14 @@ Deployment guide (documentation):
 
 Async is the base API (D33), not a later addition. Notes carried over from the old v2 plan:
 - `Store` methods return the driver's future (`BoxFuture` in `AsyncIoDriver`, `LocalBoxFuture` in
-  `OwnedBufDriver`); `Claimer::try_lock` returns `BoxFuture`; inherent methods are `async fn` (§7).
+  `OwnedBufDriver`); `Claimer::try_lock` returns `BoxFuture`; inherent methods are `async fn` or
+  return `impl Future` (§7, D80).
   `AsyncIoDriver` handles use the `futures` I/O traits (tokio users adapt with
   `tokio_util::compat`); `OwnedBufDriver` handles pass owned `Bytes` chunks (§4.3).
 - **`Send` futures (`AsyncIoDriver`)**: claim methods take `&mut self`, so using a claim keeps
   futures `Send` (§4.2), readers/writers are `Send` (§4.3), and so are the `claim()` and
-  `shutdown()` futures. In `OwnedBufDriver` none of this is `Send`, by design (D74).
+  `shutdown()` futures. A task awaiting `Claim`'s object methods is `Send + 'static`, so it can
+  be spawned (D80). In `OwnedBufDriver` none of this is `Send`, by design (D74).
 - **Which runtimes fit**: work-stealing runtimes use `AsyncIoDriver`; thread-per-core runtimes use
   `OwnedBufDriver` for stores, but their claimers must still lock without runtime I/O (P50).
 - **No async in `release` or `Drop`**: `ClaimLock::release` is synchronous and must not block;
@@ -629,7 +637,7 @@ root.
 | `lib-vault` | the core API: `Vault<D>`, `Claim<D>`, `Key`, the `Store<D>` / `Claimer` / `ClaimLock` traits, the I/O drivers in `io_driver`, `Error` |
 | `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<AsyncIoDriver>`, any claimer), `FsClaimer` (`FsStore` only), `FsStoreOptions`, `Sharing`, `PosixError`; requires a tokio runtime (D56) |
 | `lib-vault-memory` | the in-memory backend for tests and getting started (D51): `MemoryStore`, `MemoryClaimer`, `vault()`; integration tests in `tests/` exercise the core API against it |
-| `lib-vault-sqlite` | the SQLite backend for typed values (D78, API sketch): `SqliteStore<D>` and its driver `SqliteDriver<D>` over an app-supplied `Dispatcher`, `SqliteReader`/`SqliteWriter`, `SqliteClaimer` (any store), `SqliteError`; sqlx, requires a tokio runtime |
+| `lib-vault-sqlite` | the SQLite backend for typed values (D78, D79): `SqliteStore<D>` and its driver `SqliteDriver<D>` over an app-supplied `Dispatcher`, `SqliteReader`/`SqliteWriter`, `SqliteClaimer` and `SqliteClaimerOptions` (any store), `SqliteError`; sqlx, requires a tokio runtime; integration tests in `tests/sqlite/` against real database files |
 
 Modules in `lib-vault/src/`:
 
@@ -660,16 +668,16 @@ Modules in `lib-vault-posix/src/`:
 It depends on `rustix` (D52) and tokio (D56); neither is a dependency of the other crates.
 *(Future)* `criterion` benchmarks in `benches/` for the performance harness (D57).
 
-Modules in `lib-vault-sqlite/src/` (D78; every method is `todo!()` for now):
+Modules in `lib-vault-sqlite/src/` (D78, D79):
 
 | Module | Contents |
 |---|---|
-| `lib.rs` | re-exports, crate docs with a compile-checked `no_run` example |
+| `lib.rs` | re-exports, crate docs with a runnable example (in-memory database) and a `compile_fail` borrow check |
 | `dispatch.rs` | `Dispatcher`, `DispatchError` |
 | `driver.rs` | `SqliteDriver<D>` (`IoDriver`, `IntoStorePtr`) |
 | `handles.rs` | `SqliteReader`, `SqliteWriter` |
-| `store.rs` | `SqliteStore<D>` |
-| `claimer.rs` | `SqliteClaimer` and its lock (P65, P66 open) |
+| `store.rs` | `SqliteStore<D>`: pooled reads, `BEGIN IMMEDIATE` writes and deletes |
+| `claimer.rs` | `SqliteClaimer`, `SqliteClaimerOptions`, the in-process held set, the lock, and the background task (row deletion, lease renewal, shutdown) |
 | `error.rs` | `SqliteError` |
 
 ## 13. Verification strategy
@@ -681,8 +689,9 @@ Modules in `lib-vault-sqlite/src/` (D78; every method is `todo!()` for now):
   `starts_with`/`strip_prefix`, `parent`/`object_name`, parse/display round trip.
 - **Compile-time checks** (done for `AsyncIoDriver`): `Claim<AsyncIoDriver>: Send`,
   `Vault<AsyncIoDriver>: Send + Sync + Clone`, and `Send` futures from `Vault::claim` and
-  `Vault::shutdown`; `claim.release()` with a live reader doesn't compile (a `compile_fail`
-  doctest in `lib-vault-memory`). To add: a test that an `OwnedBufDriver` store holding `!Send`
+  `Vault::shutdown`; a task awaiting every `Claim` object method is `Send + 'static` (D80);
+  `claim.release()` with a live reader doesn't compile (`compile_fail` doctests in
+  `lib-vault-memory` and `lib-vault-sqlite`). To add: a test that an `OwnedBufDriver` store holding `!Send`
   state works through `Vault<OwnedBufDriver>`.
 - **Core, against an in-memory backend**: scoped claims can't reach outside their key (D36);
   overlapping claims conflict in both directions and disjoint ones don't (D44);
@@ -703,4 +712,21 @@ Modules in `lib-vault-sqlite/src/` (D78; every method is `todo!()` for now):
     another opens in a loop); the verify-after-lock retry path; bind mounts; cross-uid in a
     root-capable container; a **Linux** run;
   - CI matrix: Linux (kernel ≥ 5.6) and macOS 15, on Rust 1.89 (the MSRV) and stable.
+- **SQLite backend** (`lib-vault-sqlite/tests/sqlite/`, 29 tests against real database files,
+  through an example app's `Dispatcher` in `app.rs`):
+  - done: round trips through `try_as`, `value` and `into_value`; values land in the app's typed
+    columns under full keys; migration on store creation; key forms and `None`; `NotFound`
+    with the full key; `WrongType`; commit on `close()` (dropped writers, `close` without
+    `put`, last `put` wins); overwriting with another type; `delete` and `delete(None)`;
+    component-wise `list`; scoping; the case rule via the dispatcher's unique index; dispatcher
+    errors surfaced; persistence across pools; 16 concurrent writers; the store with
+    `MemoryClaimer` and the claimer with `MemoryStore`. Claims: conflicts in both directions
+    within a claimer and between claimers on one file; immediate in-process release and
+    lagging cross-claimer release; claim rows and live leases; refused and cancelled claims
+    hold nothing; expired leases free their claims while live ones exclude; a short lease
+    renewed past its length; a dropped claimer's rows deleted; `shutdown()`; exactly one
+    winner among 16 racing claims; and a **multi-process** test (a child holds a claim and
+    writes a value, then is killed with `kill -9`; the key frees once its lease runs out).
+  - to do: a stalled-runtime test (a live claimer losing its lease) would need control over
+    the background task's clock; a **Linux** run.
 - *(future)* Performance harness (D57): per-claim fd and syscall counts, acquisition latency vs key depth and contention.

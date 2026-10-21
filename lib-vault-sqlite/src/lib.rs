@@ -1,8 +1,6 @@
 //! A SQLite backend for `lib-vault` that stores the app's own typed values rather than bytes:
 //! a [`SqliteStore`], its I/O driver [`SqliteDriver`], and a [`SqliteClaimer`].
 //!
-//! **Status: API sketch.** Every method is `todo!()`; nothing talks to a database yet.
-//!
 //! The app supplies a [`Dispatcher`]: one value type for the vault (usually an enum with a
 //! variant per struct) and the code that reads, writes, deletes and lists those values on a
 //! SQLite connection. The store calls it for every operation, and `Claim` passes the typed
@@ -11,10 +9,11 @@
 //! Built on sqlx, so it requires the app to run on a **tokio** runtime (like `lib-vault-posix`,
 //! D56).
 //!
-//! ```no_run
+//! ```
 //! use lib_vault::{Key, Vault};
 //! use lib_vault_sqlite::{DispatchError, Dispatcher, SqliteClaimer, SqliteDriver, SqliteStore};
-//! use sqlx::sqlite::{SqliteConnection, SqlitePool};
+//! use sqlx::Row;
+//! use sqlx::sqlite::{SqliteConnection, SqlitePool, SqlitePoolOptions};
 //!
 //! struct MyDataObj {
 //!     title: String,
@@ -40,31 +39,77 @@
 //!     }
 //! }
 //!
-//! // Maps `AppValue` onto tables; the queries are the app's choice.
+//! // Maps `AppValue` onto a `docs` table. The case-insensitive unique index enforces the
+//! // case rule every store must (D6).
 //! struct AppDispatcher;
 //!
 //! impl Dispatcher for AppDispatcher {
 //!     type Value = AppValue;
 //!
 //!     async fn migrate(&self, conn: &mut SqliteConnection) -> Result<(), DispatchError> {
-//!         todo!("CREATE TABLE IF NOT EXISTS docs (key TEXT PRIMARY KEY, title TEXT)")
+//!         sqlx::query("CREATE TABLE IF NOT EXISTS docs (key TEXT PRIMARY KEY, title TEXT NOT NULL)")
+//!             .execute(&mut *conn)
+//!             .await?;
+//!         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS docs_nocase ON docs (key COLLATE NOCASE)")
+//!             .execute(&mut *conn)
+//!             .await?;
+//!         Ok(())
 //!     }
+//!
 //!     async fn read(&self, conn: &mut SqliteConnection, key: &Key) -> Result<Option<AppValue>, DispatchError> {
-//!         todo!("SELECT title FROM docs WHERE key = ?")
+//!         let row = sqlx::query("SELECT title FROM docs WHERE key = ?")
+//!             .bind(key.as_str())
+//!             .fetch_optional(&mut *conn)
+//!             .await?;
+//!         Ok(row.map(|row| AppValue::Doc(MyDataObj { title: row.get("title") })))
 //!     }
+//!
 //!     async fn write(&self, conn: &mut SqliteConnection, key: &Key, value: AppValue) -> Result<(), DispatchError> {
-//!         todo!("INSERT OR REPLACE INTO docs ...")
+//!         let AppValue::Doc(doc) = value;
+//!         sqlx::query(
+//!             "INSERT INTO docs (key, title) VALUES (?, ?)
+//!              ON CONFLICT (key) DO UPDATE SET title = excluded.title",
+//!         )
+//!         .bind(key.as_str())
+//!         .bind(doc.title)
+//!         .execute(&mut *conn)
+//!         .await?;
+//!         Ok(())
 //!     }
+//!
 //!     async fn delete(&self, conn: &mut SqliteConnection, key: &Key) -> Result<(), DispatchError> {
-//!         todo!("DELETE FROM docs WHERE key = ?")
+//!         sqlx::query("DELETE FROM docs WHERE key = ?")
+//!             .bind(key.as_str())
+//!             .execute(&mut *conn)
+//!             .await?;
+//!         Ok(())
 //!     }
+//!
 //!     async fn list(&self, conn: &mut SqliteConnection, key: &Key) -> Result<Vec<Key>, DispatchError> {
-//!         todo!("SELECT key FROM docs WHERE key LIKE ? || '/%'")
+//!         // Component-wise: `a` matches `a/b`, not `ab`.
+//!         let rows = sqlx::query("SELECT key FROM docs WHERE substr(key, 1, length(?) + 1) = ? || '/'")
+//!             .bind(key.as_str())
+//!             .bind(key.as_str())
+//!             .fetch_all(&mut *conn)
+//!             .await?;
+//!         let mut keys = Vec::new();
+//!         for row in rows {
+//!             let full = Key::new(row.get("key"))?;
+//!             keys.extend(full.strip_prefix(key));
+//!         }
+//!         Ok(keys)
 //!     }
 //! }
 //!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let pool = SqlitePool::connect("sqlite:app.db").await?;
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // One connection keeps the in-memory database alive; use a file in real apps.
+//! let pool: SqlitePool = SqlitePoolOptions::new()
+//!     .max_connections(1)
+//!     .idle_timeout(None)
+//!     .max_lifetime(None)
+//!     .connect("sqlite::memory:")
+//!     .await?;
 //! let vault: Vault<SqliteDriver<AppDispatcher>> = Vault::new(
 //!     SqliteStore::new(pool.clone(), AppDispatcher).await?,
 //!     SqliteClaimer::new(pool).await?,
@@ -81,10 +126,18 @@
 //! # Ok(())
 //! # }
 //! ```
-
-// API sketch: the bodies are `todo!()`, so fields and arguments are unused. Remove when
-// implemented.
-#![allow(dead_code, unused_variables)]
+//!
+//! Handles borrow the claim, so a claim can't be released while one is open (D42):
+//!
+//! ```compile_fail
+//! # use lib_vault::Claim;
+//! # use lib_vault_sqlite::{Dispatcher, SqliteDriver};
+//! # async fn f<D: Dispatcher>(mut claim: Claim<SqliteDriver<D>>) {
+//! let reader = claim.open_read(None).await.unwrap();
+//! claim.release().unwrap(); // error: `claim` is still borrowed by `reader`
+//! drop(reader);
+//! # }
+//! ```
 
 mod claimer;
 mod dispatch;
@@ -93,7 +146,7 @@ mod error;
 mod handles;
 mod store;
 
-pub use claimer::SqliteClaimer;
+pub use claimer::{SqliteClaimer, SqliteClaimerOptions};
 pub use dispatch::{DispatchError, Dispatcher};
 pub use driver::SqliteDriver;
 pub use error::SqliteError;
@@ -110,35 +163,35 @@ mod tests {
     impl Dispatcher for NoDispatcher {
         type Value = ();
 
-        async fn migrate(&self, conn: &mut sqlx::SqliteConnection) -> Result<(), DispatchError> {
+        async fn migrate(&self, _conn: &mut sqlx::SqliteConnection) -> Result<(), DispatchError> {
             unimplemented!()
         }
         async fn read(
             &self,
-            conn: &mut sqlx::SqliteConnection,
-            key: &Key,
+            _conn: &mut sqlx::SqliteConnection,
+            _key: &Key,
         ) -> Result<Option<()>, DispatchError> {
             unimplemented!()
         }
         async fn write(
             &self,
-            conn: &mut sqlx::SqliteConnection,
-            key: &Key,
-            value: (),
+            _conn: &mut sqlx::SqliteConnection,
+            _key: &Key,
+            _value: (),
         ) -> Result<(), DispatchError> {
             unimplemented!()
         }
         async fn delete(
             &self,
-            conn: &mut sqlx::SqliteConnection,
-            key: &Key,
+            _conn: &mut sqlx::SqliteConnection,
+            _key: &Key,
         ) -> Result<(), DispatchError> {
             unimplemented!()
         }
         async fn list(
             &self,
-            conn: &mut sqlx::SqliteConnection,
-            key: &Key,
+            _conn: &mut sqlx::SqliteConnection,
+            _key: &Key,
         ) -> Result<Vec<Key>, DispatchError> {
             unimplemented!()
         }

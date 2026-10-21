@@ -1,4 +1,6 @@
-use crate::{Dispatcher, SqliteStore};
+use crate::error::store_error;
+use crate::{Dispatcher, SqliteError, SqliteStore};
+use futures::future::BoxFuture;
 use lib_vault::{Error, Key};
 use std::marker::PhantomData;
 
@@ -10,26 +12,35 @@ pub struct SqliteReader<'a, D: Dispatcher> {
 }
 
 impl<D: Dispatcher> SqliteReader<'_, D> {
+    pub(crate) fn new(key: Key, value: D::Value) -> Self {
+        Self {
+            key,
+            value,
+            _claim: PhantomData,
+        }
+    }
+
     /// The full key the value was read from.
     pub fn key(&self) -> &Key {
-        todo!()
+        &self.key
     }
 
     /// The value, as the dispatcher's value type.
     pub fn value(&self) -> &D::Value {
-        todo!()
+        &self.value
     }
 
     /// Takes the value, as the dispatcher's value type.
     pub fn into_value(self) -> D::Value {
-        todo!()
+        self.value
     }
 
     /// Takes the value as one of the app's types, e.g. `reader.try_as::<MyDataObj>()`.
-    /// Fails with `Error::StoreError` wrapping [`SqliteError::WrongType`](crate::SqliteError::WrongType)
+    /// Fails with `Error::StoreError` wrapping [`SqliteError::WrongType`]
     /// if the conversion from the value type fails.
     pub fn try_as<T: TryFrom<D::Value>>(self) -> Result<T, Error> {
-        todo!()
+        let Self { key, value, .. } = self;
+        T::try_from(value).map_err(|_| store_error(SqliteError::WrongType { key }))
     }
 }
 
@@ -42,14 +53,31 @@ pub struct SqliteWriter<'a, D: Dispatcher> {
     pending: Option<D::Value>,
 }
 
-impl<D: Dispatcher> SqliteWriter<'_, D> {
+impl<'a, D: Dispatcher> SqliteWriter<'a, D> {
+    pub(crate) fn new(store: &'a SqliteStore<D>, key: Key) -> Self {
+        Self {
+            store,
+            key,
+            pending: None,
+        }
+    }
+
     /// Sets the value to write, replacing any earlier `put` on this writer.
     pub fn put(&mut self, value: impl Into<D::Value>) {
-        todo!()
+        self.pending = Some(value.into());
     }
 
     /// Commits the value. Closing without a `put` leaves the key unchanged.
-    pub async fn close(self) -> Result<(), Error> {
-        todo!()
+    ///
+    /// Returns a boxed `Send` future rather than being an `async fn`: the future borrows the
+    /// store for `'a`, and inside a spawned task the compiler can't otherwise prove such a
+    /// future `Send` for every `'a`.
+    pub fn close(self) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(async move {
+            match self.pending {
+                Some(value) => self.store.commit(&self.key, value).await,
+                None => Ok(()),
+            }
+        })
     }
 }

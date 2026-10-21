@@ -23,7 +23,7 @@ are pluggable backends.
 | [`lib-vault`](lib-vault) | Core API: `Vault`, `Claim`, `Key`, the `Store` and `Claimer` traits | Writing a backend, or naming the types in your app |
 | [`lib-vault-memory`](lib-vault-memory) | In-memory backend, no dependencies | Tests, examples, prototyping |
 | [`lib-vault-posix`](lib-vault-posix) | Filesystem backend for Linux and macOS (tokio) | Real persistent storage |
-| [`lib-vault-sqlite`](lib-vault-sqlite) | SQLite backend for typed values (sqlx, tokio); API sketch only | Structured app data |
+| [`lib-vault-sqlite`](lib-vault-sqlite) | SQLite backend for typed values (sqlx, tokio) | Structured app data |
 
 ## Quick start
 
@@ -70,13 +70,13 @@ same claimer.
 |---|---|---|---|
 | `MemoryStore` (`lib-vault-memory`) | No | Any, or none | Any |
 | `FsStore` (`lib-vault-posix`) | Yes | tokio | Linux ≥ 5.6, macOS ≥ 15 |
-| `SqliteStore` (`lib-vault-sqlite`, sketch) | Yes | tokio | Any SQLite supports |
+| `SqliteStore` (`lib-vault-sqlite`) | Yes | tokio | Any SQLite supports |
 
 | Claimer | Excludes | Works with |
 |---|---|---|
 | `MemoryClaimer` (`lib-vault-memory`) | Vaults in one process sharing the claimer | Any store |
 | `FsClaimer` (`lib-vault-posix`) | Processes on one host sharing the root | `FsStore` only |
-| `SqliteClaimer` (`lib-vault-sqlite`, sketch) | Processes sharing the database file | Any store |
+| `SqliteClaimer` (`lib-vault-sqlite`) | Processes sharing the database file (lease-based) | Any store |
 
 ## Documentation
 
@@ -99,5 +99,4 @@ cargo fmt --all
 
 Pre-1.0 and not published; the API may still change. `lib-vault-posix` is tested on macOS;
 Linux testing is pending. Thread-per-core (`OwnedBufDriver`) support is in the core API, but no
-backend implements it yet. `lib-vault-sqlite` is an API sketch: it compiles, but every method
-is `todo!()`.
+backend implements it yet. `lib-vault-sqlite` is tested on macOS with SQLite's bundled build.
