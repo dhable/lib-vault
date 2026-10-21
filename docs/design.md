@@ -629,6 +629,7 @@ root.
 | `lib-vault` | the core API: `Vault<D>`, `Claim<D>`, `Key`, the `Store<D>` / `Claimer` / `ClaimLock` traits, the I/O drivers in `io_driver`, `Error` |
 | `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<AsyncIoDriver>`, any claimer), `FsClaimer` (`FsStore` only), `FsStoreOptions`, `Sharing`, `PosixError`; requires a tokio runtime (D56) |
 | `lib-vault-memory` | the in-memory backend for tests and getting started (D51): `MemoryStore`, `MemoryClaimer`, `vault()`; integration tests in `tests/` exercise the core API against it |
+| `lib-vault-sqlite` | the SQLite backend for typed values (D78, API sketch): `SqliteStore<D>` and its driver `SqliteDriver<D>` over an app-supplied `Dispatcher`, `SqliteReader`/`SqliteWriter`, `SqliteClaimer` (any store), `SqliteError`; sqlx, requires a tokio runtime |
 
 Modules in `lib-vault/src/`:
 
@@ -658,6 +659,18 @@ Modules in `lib-vault-posix/src/`:
 
 It depends on `rustix` (D52) and tokio (D56); neither is a dependency of the other crates.
 *(Future)* `criterion` benchmarks in `benches/` for the performance harness (D57).
+
+Modules in `lib-vault-sqlite/src/` (D78; every method is `todo!()` for now):
+
+| Module | Contents |
+|---|---|
+| `lib.rs` | re-exports, crate docs with a compile-checked `no_run` example |
+| `dispatch.rs` | `Dispatcher`, `DispatchError` |
+| `driver.rs` | `SqliteDriver<D>` (`IoDriver`, `IntoStorePtr`) |
+| `handles.rs` | `SqliteReader`, `SqliteWriter` |
+| `store.rs` | `SqliteStore<D>` |
+| `claimer.rs` | `SqliteClaimer` and its lock (P65, P66 open) |
+| `error.rs` | `SqliteError` |
 
 ## 13. Verification strategy
 

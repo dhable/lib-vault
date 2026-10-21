@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["lib-vault", "lib-vault-posix", "lib-vault-memory"]
+members = ["lib-vault", "lib-vault-posix", "lib-vault-memory", "lib-vault-sqlite"]
 
 # Shared package metadata. Member crates opt in with `<field>.workspace = true`.
 [workspace.package]
@@ -18,6 +18,7 @@ rustix = { version = "1.1", features = ["fs", "process"] }
 tokio = { version = "1.53", default-features = false }
 tokio-util = { version = "0.7", default-features = false }
 tempfile = "3"
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }
 
 # Workspace crates, referenced by path.
 lib-vault = { path = "lib-vault" }

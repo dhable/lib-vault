@@ -82,6 +82,13 @@ These were core decisions when the vault was filesystem-only. They now describe 
 | D74 | Store pointer per driver | `Store<D>` has no `Send`/`Sync` supertraits (only `'static`), so an `OwnedBufDriver` store can hold `!Send` runtime state (an `Rc`, a ring handle). The bounds move to the driver's `IoDriver::StorePtr`, how a `Vault` and its claims hold the store: `Arc<dyn Store<AsyncIoDriver> + Send + Sync>` in `AsyncIoDriver`, `Rc<dyn Store<OwnedBufDriver>>` in `OwnedBufDriver`. `StorePtr: Clone + Deref<Target: Store<Self>>`, so `Claim` calls the store the same way with every driver. `Vault::new<S>(store: S, claimer) where D: IntoStorePtr<S>`: each driver implements `IntoStorePtr<S>` for every store meeting its bounds (the driver is the implementing type, D77) (`Send + Sync` stores in `AsyncIoDriver`, any store in `OwnedBufDriver`), so existing backends' stores are accepted unchanged. Consequence: `Claim<OwnedBufDriver>` and `Vault<OwnedBufDriver>` are `!Send` (D37). Resolves the store half of P50. | §2, §5, §7 |
 | D75 | Choosing a claimer for `FsStore` | The posix API makes the claimer a visible, separate choice, because `FsStore` with a non-`flock` claimer (e.g. a future ZooKeeper-based `ZkClaimer` for hosts sharing storage) is an expected common case. **(1)** No `lib_vault_posix::vault()` helper: a vault is always `Vault::new(store, claimer)`. **(2)** The constructor is on the claimer, `FsClaimer::new(&FsStore)` (was `FsStore::claimer()`), so the dependency points the way it really runs: `FsClaimer` needs an `FsStore` tree for its lock files, while `FsStore` never relies on the claimer (it creates its own directories; lock files exist only with `FsClaimer`). **(3)** Documented in the crate docs and README with a claimer table, plus the rule that **every process using a root must use the same kind of claimer** (different claimers don't see each other's claims); documented, not detected, like D72. **(4)** `tests/claimers.rs` runs `FsStore` with a `MemoryClaimer` to guard the independence. `lib_vault_memory::vault()` stays as a test shortcut. Refines D45, D73. | §6, §8 |
 
+### SQLite backend (`SqliteStore` + `SqliteClaimer`)
+The first backend with its own I/O driver (D77). API sketch only: every method is `todo!()`.
+
+| # | Topic | Decision | Ref |
+|---|---|---|---|
+| D78 | SQLite backend (sketch) | `lib-vault-sqlite` stores the app's own typed values. **sqlx** (`sqlite`, `runtime-tokio`), so like `lib-vault-posix` it requires a tokio runtime (D56), and SeaORM-style mapping can run on the same connections. **One app-supplied `Dispatcher`** does every operation: `type Value` (the vault's single value type, usually an app enum with a variant per struct) plus `migrate`, `read`, `write`, `delete`, `list` on a `&mut SqliteConnection`, as `impl Future + Send` methods. The store passes full keys straight through, so the dispatcher upholds the `Store` contract (D6 case rule, D36, D40, D43). **The driver is generic over the dispatcher**, `SqliteDriver<D>` (`BoxFuture`, `Arc` store pointer), so `Vault<SqliteDriver<AppDispatcher>>` is type-safe with no `Any` downcasts, while `dyn Store<SqliteDriver<D>>` stays dyn-compatible. **Handles:** `open_read` fetches the value, so a missing key fails there with `NotFound` (D43); `SqliteReader` has `value`, `into_value` and `try_as::<T>()` (via `TryFrom<Value>`, `SqliteError::WrongType` otherwise). `SqliteWriter::put(impl Into<Value>)` buffers, and `close()` commits by running the dispatcher's `write` in a transaction; a writer dropped without `close()` discards (as in D51). `SqliteStore::new(pool, dispatcher)` runs `migrate`; the store works with any claimer. **`SqliteClaimer`** keeps claims in a `vault_claims` table so processes sharing the database file exclude each other: `try_lock` is one `BEGIN IMMEDIATE` transaction refusing equal, ancestor and descendant keys (D44). It works with any store. Open: P65, P66. | §6, §12 |
+
 ### Superseded
 | # | Was | Superseded by |
 |---|---|---|
@@ -123,6 +130,12 @@ any runtime, and must not block or panic (`design.md` §4.4).
 ### Filesystem backend
 | # | Question | Options |
 |---|---|---|
+
+### SQLite backend
+| # | Question | Options |
+|---|---|---|
+| P65 | `SqliteClaimLock::release` must be synchronous and non-blocking, with `Ok` meaning the key can be claimed again immediately (D39), but deleting the claim row is async sqlx work. | Release in-process at once (a local held-key set the claimer checks first) and delete the row in the background, accepting that other processes see the release late; a dedicated thread with its own blocking connection; or relax D39 for claimers whose release is remote. |
+| P66 | A crashed process leaves its claim rows behind, blocking those keys forever. | An `owner` identity plus a lease renewed while held (expired rows are free); a startup sweep of rows owned by dead processes (only works on one host); or manual cleanup, documented. |
 
 ### Closed
 | # | Resolution |
@@ -197,5 +210,6 @@ any runtime, and must not block or panic (`design.md` §4.4).
 | D12 errors | ✅ `thiserror` enum. |
 | D51 memory backend | ✅ `Store<AsyncIoDriver>` only. |
 | D77 I/O drivers | ✅ `io_driver::{IoDriver, AsyncIoDriver, OwnedBufDriver}`; `IoDriver` unsealed; `IntoStorePtr<S>` implemented by the driver. ⚠ No driver outside `lib-vault` exists yet. |
+| D78 SQLite backend | ⚠ API sketch only: `lib-vault-sqlite` compiles (`SqliteDriver<D>`, `Dispatcher`, `SqliteStore`, `SqliteReader`/`SqliteWriter`, `SqliteClaimer`, `SqliteError`), with a compile-checked `no_run` example and a `Send` check; every method is `todo!()`. P65, P66 open. |
 | D76 tests as examples | ✅ `lib-vault-memory/tests` and `lib-vault-posix/tests` call the API directly; both `tests/common` modules removed. |
 | D73 posix backend | ✅ `FsStore` + `FsClaimer`, journaling, strict modes, ACL refusal, network warning, lock files, create-on-write; 39 tests pass on macOS. D75: `FsStore` composes with any claimer (`FsClaimer::new(&store)`), tested with `MemoryClaimer`. ⚠ Not yet run on Linux. |

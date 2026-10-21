@@ -1,0 +1,12 @@
+[package]
+name = "lib-vault-sqlite"
+version.workspace = true
+edition.workspace = true
+description = "SQLite lib-vault backend storing typed values (API sketch)"
+readme = "README.md"
+
+[dependencies]
+lib-vault.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+sqlx.workspace = true
