@@ -1,6 +1,6 @@
 //! `FsStore`: objects are regular files under the vault root, one per key (§8).
 
-use crate::fsops;
+use crate::fsops::{self, Device};
 use crate::journal::{self, Crc32};
 use crate::root::Root;
 use crate::{FsStoreOptions, PosixError};
@@ -158,7 +158,7 @@ fn collect(
         };
         match fsops::file_type(&stat) {
             FileType::RegularFile => out.push(key),
-            FileType::Directory if stat.st_dev as u64 == root.dev => {
+            FileType::Directory if fsops::dev_of(&stat) == root.dev => {
                 if let Some(sub) = fsops::open_dir(dir, &name, root.dev, &entry_path)? {
                     collect(root, &sub, &entry_path, Some(&key), out)?;
                 }
@@ -317,7 +317,7 @@ fn open_or_create_object(
 fn open_or_create(
     dir: &OwnedFd,
     name: &str,
-    dev: u64,
+    dev: Device,
     mode: u32,
     path: &Path,
 ) -> Result<File, PosixError> {
@@ -348,7 +348,7 @@ struct WriteCtx {
     dir: OwnedFd,
     name: String,
     path: PathBuf,
-    dev: u64,
+    dev: Device,
     file_mode: u32,
     target: Target,
 }

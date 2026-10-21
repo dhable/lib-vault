@@ -51,12 +51,12 @@ pub(crate) fn is_reserved(name: &str) -> bool {
     name.starts_with(RESERVED_PREFIX)
 }
 
-/// The device every vault file must be on (no mount crossings, §8.2).
-pub(crate) type Device = u64;
+/// The device every vault file must be on (no mount crossings, §8.2). The platform's
+/// `dev_t` (`u64` on Linux, `i32` on macOS), so device numbers are compared without casts.
+pub(crate) type Device = rustix::fs::Dev;
 
-fn dev_of(stat: &Stat) -> Device {
-    #[allow(clippy::useless_conversion)]
-    u64::from(stat.st_dev as u64)
+pub(crate) fn dev_of(stat: &Stat) -> Device {
+    stat.st_dev
 }
 
 /// Opens directory `name` in `dir` without following symlinks, checking it's a directory on
