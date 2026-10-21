@@ -2,6 +2,7 @@
 name = "lib-vault"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Core API for confined, exclusively claimed storage for AI harnesses"
 readme = "README.md"
 

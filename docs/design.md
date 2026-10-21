@@ -711,7 +711,9 @@ Modules in `lib-vault-sqlite/src/` (D78, D79):
   - to do: a race test (a thread flips a path component between a directory and a symlink while
     another opens in a loop); the verify-after-lock retry path; bind mounts; cross-uid in a
     root-capable container; a **Linux** run;
-  - CI matrix: Linux (kernel ≥ 5.6) and macOS 15, on Rust 1.89 (the MSRV) and stable.
+  - CI (D81): clippy on Linux and macOS; build and tests on Linux, macOS and Windows (without
+    `lib-vault-posix`) on stable; library builds on each crate's MSRV (1.89, and 1.94 for
+    `lib-vault-sqlite`).
 - **SQLite backend** (`lib-vault-sqlite/tests/sqlite/`, 29 tests against real database files,
   through an example app's `Dispatcher` in `app.rs`):
   - done: round trips through `try_as`, `value` and `into_value`; values land in the app's typed

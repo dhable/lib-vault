@@ -1,5 +1,7 @@
 # lib-vault
 
+[![CI](https://github.com/dhable/lib-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/dhable/lib-vault/actions/workflows/ci.yml)
+
 Confined, exclusively claimed storage for AI harnesses: memory context, scratchpads, artifacts.
 
 An app asks a `Vault` for a `Claim` on a key such as `sessions/123`. The claim is the only way
@@ -92,7 +94,8 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
-- Rust 1.89+ (edition 2024; `lib-vault-posix` needs 1.89 for `File::lock`).
+- Rust 1.89+ (edition 2024; `lib-vault-posix` needs 1.89 for `File::lock`); `lib-vault-sqlite`
+  needs 1.94+ (sqlx 0.9).
 - The `lib-vault-posix` tests need Linux or macOS and a local temp directory.
 
 ## Status

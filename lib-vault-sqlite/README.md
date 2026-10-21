@@ -50,5 +50,6 @@ works with any claimer.
 
 ## Requirements
 
+- Rust 1.94+ (sqlx 0.9).
 - A tokio runtime (sqlx with `runtime-tokio`; the claimer spawns a background task).
 - SQLite is bundled (sqlx's `sqlite` feature). Use WAL journal mode for concurrent access.

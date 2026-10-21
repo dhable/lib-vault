@@ -2,6 +2,8 @@
 name = "lib-vault-sqlite"
 version.workspace = true
 edition.workspace = true
+# sqlx 0.9 requires Rust 1.94; the rest of the workspace builds on 1.89.
+rust-version = "1.94"
 description = "SQLite lib-vault backend storing typed values"
 readme = "README.md"
 

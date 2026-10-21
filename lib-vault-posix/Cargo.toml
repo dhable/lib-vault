@@ -2,7 +2,7 @@
 name = "lib-vault-posix"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.89"
+rust-version.workspace = true
 description = "Filesystem lib-vault backend for Linux and macOS"
 readme = "README.md"
 

@@ -6,6 +6,7 @@ members = ["lib-vault", "lib-vault-posix", "lib-vault-memory", "lib-vault-sqlite
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 
 # Shared dependency versions and features. Member crates opt in with
 # `<name>.workspace = true` so every crate uses the same definition.

@@ -2,6 +2,7 @@
 name = "lib-vault-memory"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "In-memory lib-vault backend for tests and prototyping"
 readme = "README.md"
 
