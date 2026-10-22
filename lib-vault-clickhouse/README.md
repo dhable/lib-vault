@@ -78,3 +78,7 @@ Keeper (embedded `clickhouse-keeper` or ZooKeeper) configured with `<zookeeper>`
 
 - Rust 1.89+.
 - A tokio runtime (the `clickhouse` client; the claimer spawns a background task).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

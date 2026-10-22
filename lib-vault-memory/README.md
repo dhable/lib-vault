@@ -53,3 +53,7 @@ let b: Vault<lib_vault::io_driver::AsyncIoDriver> = Vault::new(store, claimer);
 
 - `AsyncIoDriver` only.
 - No async runtime: works with tokio, any other runtime, or `futures::executor::block_on`.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

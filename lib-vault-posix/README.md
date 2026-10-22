@@ -122,3 +122,7 @@ Construction returns `PosixError`. Claim and store operations wrap it in
 Protocol and security model: [`docs/design.md`](../docs/design.md) §8–§9.
 
 Tested on macOS; Linux testing is pending.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
