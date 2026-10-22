@@ -53,3 +53,7 @@ works with any claimer.
 - Rust 1.94+ (sqlx 0.9).
 - A tokio runtime (sqlx with `runtime-tokio`; the claimer spawns a background task).
 - SQLite is bundled (sqlx's `sqlite` feature). Use WAL journal mode for concurrent access.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

@@ -125,3 +125,7 @@ The enum is `#[non_exhaustive]`.
 
 Design and rationale: [`docs/design.md`](../docs/design.md) §2–§7,
 [`docs/decisions.md`](../docs/decisions.md).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
