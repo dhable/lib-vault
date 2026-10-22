@@ -1,8 +1,8 @@
 # lib-vault — Design
 
-Status: the core API (`lib-vault`, sketch v10) and three backends are implemented:
-`lib-vault-memory` (D51), `lib-vault-posix` (D73, tested on macOS, not yet on Linux) and
-`lib-vault-sqlite` (D78, D79, typed values). The code
+Status: the core API (`lib-vault`, sketch v10) and four backends are implemented:
+`lib-vault-memory` (D51), `lib-vault-posix` (D73), `lib-vault-sqlite` (D78, D79, typed
+values) and `lib-vault-clickhouse` (D82, D83, typed values, Keeper-backed claims). The code
 is the source of truth. Decision log and open questions: [`decisions.md`](decisions.md).
 
 ## Purpose
@@ -638,6 +638,7 @@ root.
 | `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<AsyncIoDriver>`, any claimer), `FsClaimer` (`FsStore` only), `FsStoreOptions`, `Sharing`, `PosixError`; requires a tokio runtime (D56) |
 | `lib-vault-memory` | the in-memory backend for tests and getting started (D51): `MemoryStore`, `MemoryClaimer`, `vault()`; integration tests in `tests/` exercise the core API against it |
 | `lib-vault-sqlite` | the SQLite backend for typed values (D78, D79): `SqliteStore<D>` and its driver `SqliteDriver<D>` over an app-supplied `Dispatcher`, `SqliteReader`/`SqliteWriter`, `SqliteClaimer` and `SqliteClaimerOptions` (any store), `SqliteError`; sqlx, requires a tokio runtime; integration tests in `tests/sqlite/` against real database files |
+| `lib-vault-clickhouse` | the ClickHouse backend for typed values (D82, D83): `ClickhouseStore<D>` and its driver `ClickhouseDriver<D>` over an app-supplied `Dispatcher`, `ClickhouseReader`/`ClickhouseWriter`, `ClickhouseClaimer` and `ClickhouseClaimerOptions` (Keeper via `KeeperMap`, any store), `ClickhouseError`; requires a tokio runtime; integration tests behind the `integration-tests` feature, against `tests/docker/compose.yaml` |
 
 Modules in `lib-vault/src/`:
 
@@ -680,6 +681,16 @@ Modules in `lib-vault-sqlite/src/` (D78, D79):
 | `claimer.rs` | `SqliteClaimer`, `SqliteClaimerOptions`, the in-process held set, the lock, and the background task (row deletion, lease renewal, shutdown) |
 | `error.rs` | `SqliteError` |
 
+Modules in `lib-vault-clickhouse/src/` (D82, D83):
+
+| Module | Contents |
+|---|---|
+| `lib.rs` | re-exports, crate docs with a `no_run` example and a `compile_fail` borrow check |
+| `dispatch.rs`, `driver.rs`, `handles.rs`, `store.rs` | as in `lib-vault-sqlite`, over a `clickhouse::Client` |
+| `claimer.rs` | `ClickhouseClaimer`, `ClickhouseClaimerOptions`, the claim steps, and the background task (releases, lease renewal, shutdown) |
+| `protocol.rs` | the protocol's pure parts: lock plans, tokens, recognizing Keeper conflicts in server errors, root-path validation |
+| `error.rs` | `ClickhouseError` |
+
 ## 13. Verification strategy
 
 - **`Key`** (done, unit tests in `lib-vault/src/key.rs`): canonical keys accepted, each rejection case,
@@ -712,8 +723,8 @@ Modules in `lib-vault-sqlite/src/` (D78, D79):
     another opens in a loop); the verify-after-lock retry path; bind mounts; cross-uid in a
     root-capable container; a **Linux** run;
   - CI (D81): clippy on Linux and macOS; build and tests on Linux, macOS and Windows (without
-    `lib-vault-posix`) on stable; library builds on each crate's MSRV (1.89, and 1.94 for
-    `lib-vault-sqlite`).
+    `lib-vault-posix`) on stable; the ClickHouse integration tests on Linux; library builds on
+    each crate's MSRV (1.89, and 1.94 for `lib-vault-sqlite`).
 - **SQLite backend** (`lib-vault-sqlite/tests/sqlite/`, 29 tests against real database files,
   through an example app's `Dispatcher` in `app.rs`):
   - done: round trips through `try_as`, `value` and `into_value`; values land in the app's typed
@@ -731,4 +742,16 @@ Modules in `lib-vault-sqlite/src/` (D78, D79):
     writes a value, then is killed with `kill -9`; the key frees once its lease runs out).
   - to do: a stalled-runtime test (a live claimer losing its lease) would need control over
     the background task's clock; a **Linux** run.
+- **ClickHouse backend** (`lib-vault-clickhouse`; D82, D83):
+  - unit, no server: lock plans, token owners, Keeper conflict recognition (`Node exists`,
+    `Bad version`, `No node`), root-path and lease validation, `Send`/spawnability, an
+    unreachable server.
+  - integration, 30 tests against ClickHouse 26.9 with embedded Keeper
+    (`tests/docker/compose.yaml`): the SQLite suite's object semantics, plus typed columns in
+    `ReplacingMergeTree` tables and the `KeeperMap` case index; claims in both directions
+    within and between claimers, rows in the `KeeperMap` tables, refused and cancelled claims
+    holding nothing, expired leases reaped and live ones renewed, dropped and shut-down
+    claimers removing their rows, a 16-way race for one key, 16 concurrent sibling claims, the
+    claimer with `MemoryStore`, and a **multi-process** test (`kill -9`, then lease expiry).
+  - to do: a multi-node Keeper and two ClickHouse servers sharing it; a stalled-runtime test.
 - *(future)* Performance harness (D57): per-claim fd and syscall counts, acquisition latency vs key depth and contention.

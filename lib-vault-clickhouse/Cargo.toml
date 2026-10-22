@@ -1,0 +1,31 @@
+[package]
+name = "lib-vault-clickhouse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "ClickHouse lib-vault backend storing typed values, with a Keeper-backed claimer"
+readme = "README.md"
+
+[features]
+# Builds and runs the integration tests in `tests/clickhouse/`, which need a live ClickHouse
+# server with Keeper (see README). Off by default, so `cargo test` needs no server.
+integration-tests = []
+
+[dependencies]
+lib-vault.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+clickhouse.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process"] }
+futures = { workspace = true, features = ["executor"] }
+lib-vault-memory.workspace = true
+
+[[test]]
+name = "clickhouse"
+path = "tests/clickhouse/main.rs"
+required-features = ["integration-tests"]

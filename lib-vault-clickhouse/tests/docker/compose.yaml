@@ -1,0 +1,19 @@
+# ClickHouse with Keeper for lib-vault-clickhouse's integration tests:
+#   docker compose -f lib-vault-clickhouse/tests/docker/compose.yaml up -d --wait
+#   cargo test -p lib-vault-clickhouse --features integration-tests
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.9
+    ports:
+      - "8123:8123"
+    environment:
+      CLICKHOUSE_PASSWORD: vault
+    volumes:
+      - ./keeper.xml:/etc/clickhouse-server/config.d/keeper.xml:ro
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--password", "vault", "--query", "SELECT 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
