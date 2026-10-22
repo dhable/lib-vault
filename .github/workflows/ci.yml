@@ -62,6 +62,23 @@ jobs:
       # Unit, integration and doc tests.
       - run: cargo test --workspace --locked ${{ matrix.exclude }}
 
+  clickhouse:
+    name: clickhouse integration
+    # lib-vault-clickhouse's integration tests need a live server with Keeper; the other
+    # jobs run only its server-free unit tests.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: docker compose -f lib-vault-clickhouse/tests/docker/compose.yaml up -d --wait
+      - run: cargo clippy -p lib-vault-clickhouse --all-targets --features integration-tests --locked -- -D warnings
+      - run: cargo test -p lib-vault-clickhouse --features integration-tests --locked
+      - if: failure()
+        run: docker compose -f lib-vault-clickhouse/tests/docker/compose.yaml logs
+
   msrv:
     name: msrv (${{ matrix.toolchain }})
     # Libraries only: the MSRV is about what users compile, not the dev-dependencies.
@@ -70,7 +87,7 @@ jobs:
       matrix:
         include:
           - toolchain: "1.89"
-            packages: -p lib-vault -p lib-vault-memory -p lib-vault-posix
+            packages: -p lib-vault -p lib-vault-memory -p lib-vault-posix -p lib-vault-clickhouse
           # sqlx 0.9 requires Rust 1.94.
           - toolchain: "1.94"
             packages: -p lib-vault-sqlite
