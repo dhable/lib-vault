@@ -26,6 +26,7 @@ are pluggable backends.
 | [`lib-vault-memory`](lib-vault-memory) | In-memory backend, no dependencies | Tests, examples, prototyping |
 | [`lib-vault-posix`](lib-vault-posix) | Filesystem backend for Linux and macOS (tokio) | Real persistent storage |
 | [`lib-vault-sqlite`](lib-vault-sqlite) | SQLite backend for typed values (sqlx, tokio) | Structured app data |
+| [`lib-vault-clickhouse`](lib-vault-clickhouse) | ClickHouse backend for typed values, with Keeper-backed claims (tokio) | Structured data shared across hosts |
 
 ## Quick start
 
@@ -73,12 +74,14 @@ same claimer.
 | `MemoryStore` (`lib-vault-memory`) | No | Any, or none | Any |
 | `FsStore` (`lib-vault-posix`) | Yes | tokio | Linux ≥ 5.6, macOS ≥ 15 |
 | `SqliteStore` (`lib-vault-sqlite`) | Yes | tokio | Any SQLite supports |
+| `ClickhouseStore` (`lib-vault-clickhouse`) | Yes | tokio | Any (needs a ClickHouse server) |
 
 | Claimer | Excludes | Works with |
 |---|---|---|
 | `MemoryClaimer` (`lib-vault-memory`) | Vaults in one process sharing the claimer | Any store |
 | `FsClaimer` (`lib-vault-posix`) | Processes on one host sharing the root | `FsStore` only |
 | `SqliteClaimer` (`lib-vault-sqlite`) | Processes sharing the database file (lease-based) | Any store |
+| `ClickhouseClaimer` (`lib-vault-clickhouse`) | Processes and servers sharing a Keeper (lease-based) | Any store |
 
 ## Documentation
 
@@ -102,4 +105,5 @@ cargo fmt --all
 
 Pre-1.0 and not published; the API may still change. `lib-vault-posix` is tested on macOS;
 Linux testing is pending. Thread-per-core (`OwnedBufDriver`) support is in the core API, but no
-backend implements it yet. `lib-vault-sqlite` is tested on macOS with SQLite's bundled build.
+backend implements it yet. `lib-vault-sqlite` is tested on macOS with SQLite's bundled build. `lib-vault-clickhouse` is
+tested against a single-node ClickHouse 26.9 with embedded Keeper.
