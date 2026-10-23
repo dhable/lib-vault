@@ -27,6 +27,17 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  deny:
+    name: deny
+    # Dependency licenses must be Apache-2.0-compatible (D84); RustSec advisories fail the build (D85).
+    # One runner is enough: cargo-deny checks the whole lockfile graph for every target.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses
+
   clippy:
     name: clippy (${{ matrix.os }})
     # Both platforms: lib-vault-posix has Linux-only and Apple-only code.

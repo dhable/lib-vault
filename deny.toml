@@ -1,0 +1,34 @@
+# cargo-deny configuration (D85). CI runs `cargo deny check advisories licenses`.
+
+[graph]
+# Include the clickhouse `integration-tests` feature dependencies.
+all-features = true
+
+[advisories]
+# RustSec: vulnerabilities always fail; unmaintained and unsound crates fail anywhere in the graph.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+# Each ignored advisory needs a reason comment.
+ignore = []
+
+[licenses]
+# Permissive licenses compatible with distributing under Apache-2.0 (D84).
+# Copyleft (GPL, LGPL, MPL, AGPL, ...) is not listed and so is denied; a crate that offers
+# a copyleft license only as an alternative (e.g. r-efi's MIT OR Apache-2.0 OR LGPL) passes.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+# Part of the list covers likely future dependencies; don't warn that it's unused today.
+unused-allowed-license = "allow"
