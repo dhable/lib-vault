@@ -10,7 +10,13 @@ unmaintained = "all"
 unsound = "all"
 yanked = "deny"
 # Each ignored advisory needs a reason comment.
-ignore = []
+ignore = [
+    # Bundled SQLite < 3.54.0 can return uninitialized page-cache memory for a crafted db + `-wal`
+    # pair. Only exposed when opening database files a less trusted party wrote; lib-vault-sqlite
+    # opens application-owned paths. No fix is releasable yet: sqlx-sqlite 0.9.0 (latest) caps
+    # libsqlite3-sys at <0.38, and sqlx main lifts it to <0.40. Remove once sqlx ships that.
+    { id = "RUSTSEC-2026-0459", reason = "no sqlx release supports libsqlite3-sys >= 0.39 yet" },
+]
 
 [licenses]
 # Permissive licenses compatible with distributing under Apache-2.0 (D84).
