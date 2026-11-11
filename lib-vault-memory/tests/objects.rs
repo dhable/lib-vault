@@ -2,7 +2,6 @@
 //! (§4.1, D36, D48) and the case-collision rule (D6).
 
 use futures::executor::block_on;
-use futures::{AsyncReadExt, AsyncWriteExt};
 use lib_vault::{Error, Key, KeyError, MAX_DEPTH, Vault};
 use lib_vault_memory::{MemoryClaimer, MemoryStore};
 
@@ -12,15 +11,9 @@ fn write_then_read_round_trips() {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("session").unwrap()).await.unwrap();
 
-        let mut w = c.open_write("notes.md").await.unwrap();
-        w.write_all(b"hello").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("notes.md", b"hello".to_vec()).await.unwrap();
 
-        let mut buf = Vec::new();
-        let mut r = c.open_read("notes.md").await.unwrap();
-        r.read_to_end(&mut buf).await.unwrap();
-        drop(r);
+        let buf: Vec<u8> = c.load("notes.md").await.unwrap();
         assert_eq!(buf, b"hello");
     });
 }
@@ -32,22 +25,13 @@ fn key_argument_forms_are_equivalent() {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-        let mut w = c.open_write("b").await.unwrap();
-        w.write_all(b"x").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("b", b"x".to_vec()).await.unwrap();
 
         let b = Key::new("b").unwrap();
-        let mut buf = Vec::new();
-        let mut r = c.open_read(&b).await.unwrap();
-        r.read_to_end(&mut buf).await.unwrap();
-        drop(r);
+        let buf: Vec<u8> = c.load(&b).await.unwrap();
         assert_eq!(buf, b"x");
 
-        let mut buf = Vec::new();
-        let mut r = c.open_read(Some(&b)).await.unwrap();
-        r.read_to_end(&mut buf).await.unwrap();
-        drop(r);
+        let buf: Vec<u8> = c.load(Some(&b)).await.unwrap();
         assert_eq!(buf, b"x");
     });
 }
@@ -59,23 +43,14 @@ fn none_is_the_claimed_key_itself() {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a/b").unwrap()).await.unwrap();
 
-        let mut w = c.open_write(None).await.unwrap();
-        w.write_all(b"self").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store(None, b"self".to_vec()).await.unwrap();
 
-        let mut buf = Vec::new();
-        let mut r = c.open_read(None).await.unwrap();
-        r.read_to_end(&mut buf).await.unwrap();
-        drop(r);
+        let buf: Vec<u8> = c.load(None).await.unwrap();
         assert_eq!(buf, b"self");
         c.release().unwrap();
 
         let mut parent = v.claim(Key::new("a").unwrap()).await.unwrap();
-        let mut buf = Vec::new();
-        let mut r = parent.open_read("b").await.unwrap();
-        r.read_to_end(&mut buf).await.unwrap();
-        drop(r);
+        let buf: Vec<u8> = parent.load("b").await.unwrap();
         assert_eq!(buf, b"self");
     });
 }
@@ -86,17 +61,11 @@ fn keys_are_relative_to_the_claim() {
     block_on(async {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-        let mut w = c.open_write("b/c").await.unwrap();
-        w.write_all(b"deep").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("b/c", b"deep".to_vec()).await.unwrap();
         c.release().unwrap();
 
         let mut c = v.claim(Key::new("a/b/c").unwrap()).await.unwrap();
-        let mut buf = Vec::new();
-        let mut r = c.open_read(None).await.unwrap();
-        r.read_to_end(&mut buf).await.unwrap();
-        drop(r);
+        let buf: Vec<u8> = c.load(None).await.unwrap();
         assert_eq!(buf, b"deep");
     });
 }
@@ -107,15 +76,12 @@ fn a_claim_cannot_see_objects_outside_its_key() {
     block_on(async {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut outside = v.claim(Key::new("b").unwrap()).await.unwrap();
-        let mut w = outside.open_write(None).await.unwrap();
-        w.write_all(b"outside").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        outside.store(None, b"outside".to_vec()).await.unwrap();
         outside.release().unwrap();
 
         let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
         assert!(matches!(
-            c.open_read("b").await,
+            c.load::<Vec<u8>>("b").await,
             Err(Error::NotFound { .. })
         ));
         assert!(c.list(None).await.unwrap().is_empty());
@@ -124,11 +90,11 @@ fn a_claim_cannot_see_objects_outside_its_key() {
 
 #[test]
 fn reading_a_missing_object_is_not_found() {
-    // D43: `open_read` of a missing key is an error, reported with the full key.
+    // D43: `load` of a missing key is an error, reported with the full key.
     block_on(async {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-        match c.open_read("missing").await.err() {
+        match c.load::<Vec<u8>>("missing").await.err() {
             Some(Error::NotFound { key }) => assert_eq!(key, Key::new("a/missing").unwrap()),
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -137,71 +103,76 @@ fn reading_a_missing_object_is_not_found() {
 
 #[test]
 fn writing_overwrites_existing_data() {
-    // D43: `open_write` creates or overwrites.
+    // D43: `store` creates or overwrites.
     block_on(async {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-        let mut w = c.open_write("f").await.unwrap();
-        w.write_all(b"first, longer").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("f", b"first, longer".to_vec()).await.unwrap();
 
-        let mut w = c.open_write("f").await.unwrap();
-        w.write_all(b"second").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("f", b"second".to_vec()).await.unwrap();
 
-        let mut buf = Vec::new();
-        let mut r = c.open_read("f").await.unwrap();
-        r.read_to_end(&mut buf).await.unwrap();
-        drop(r);
+        let buf: Vec<u8> = c.load("f").await.unwrap();
         assert_eq!(buf, b"second");
     });
 }
 
 #[test]
-fn writes_commit_on_close() {
-    // D43: each store documents its commit point; the memory store commits on `close()`.
+fn storing_another_type_is_refused() {
+    // D86, D87: the memory store holds `Vec<u8>`; any other type is `WrongType`, reported
+    // with the full key, and nothing is stored.
     block_on(async {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-        let mut w = c.open_write("f").await.unwrap();
-        w.write_all(b"pending").await.unwrap();
-        w.flush().await.unwrap();
-        drop(w); // dropped without close: discarded
+
+        match c.store("f", String::from("text")).await.err() {
+            Some(Error::WrongType { key }) => assert_eq!(key, Key::new("a/f").unwrap()),
+            other => panic!("expected WrongType, got {other:?}"),
+        }
+        // A byte string literal is a `&[u8; N]`, not a `Vec<u8>`.
         assert!(matches!(
-            c.open_read("f").await,
+            c.store("f", b"bytes").await,
+            Err(Error::WrongType { .. })
+        ));
+        assert!(matches!(
+            c.load::<Vec<u8>>("f").await,
             Err(Error::NotFound { .. })
         ));
-
-        let mut w = c.open_write("f").await.unwrap();
-        w.write_all(b"committed").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
-
-        let mut buf = Vec::new();
-        let mut r = c.open_read("f").await.unwrap();
-        r.read_to_end(&mut buf).await.unwrap();
-        drop(r);
-        assert_eq!(buf, b"committed");
     });
 }
 
 #[test]
-fn readers_see_a_snapshot() {
+fn loading_as_another_type_is_refused() {
+    // D86: `load::<T>` of an object that isn't a `T` is `WrongType`, with the full key.
     block_on(async {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-        let mut w = c.open_write("f").await.unwrap();
-        w.write_all(b"v1").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("f", b"text".to_vec()).await.unwrap();
 
-        let mut r = c.open_read("f").await.unwrap();
-        let mut buf = Vec::new();
-        r.read_to_end(&mut buf).await.unwrap();
-        assert_eq!(buf, b"v1");
+        match c.load::<String>("f").await.err() {
+            Some(Error::WrongType { key }) => assert_eq!(key, Key::new("a/f").unwrap()),
+            other => panic!("expected WrongType, got {other:?}"),
+        }
+        // The object is still there.
+        let buf: Vec<u8> = c.load("f").await.unwrap();
+        assert_eq!(buf, b"text");
+    });
+}
+
+#[test]
+fn load_returns_a_copy() {
+    // D87: each `load` hands out its own copy of the bytes.
+    block_on(async {
+        let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
+        let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
+        c.store("f", b"v1".to_vec()).await.unwrap();
+
+        let mut first: Vec<u8> = c.load("f").await.unwrap();
+        first.extend_from_slice(b" changed");
+        c.store("g", first).await.unwrap();
+
+        let again: Vec<u8> = c.load("f").await.unwrap();
+        assert_eq!(again, b"v1");
     });
 }
 
@@ -210,14 +181,11 @@ fn deleting_removes_the_object() {
     block_on(async {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-        let mut w = c.open_write("f").await.unwrap();
-        w.write_all(b"x").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("f", b"x".to_vec()).await.unwrap();
 
         c.delete("f").await.unwrap();
         assert!(matches!(
-            c.open_read("f").await,
+            c.load::<Vec<u8>>("f").await,
             Err(Error::NotFound { .. })
         ));
     });
@@ -241,26 +209,17 @@ fn delete_none_deletes_the_claimed_object() {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-        let mut w = c.open_write(None).await.unwrap();
-        w.write_all(b"self").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store(None, b"self".to_vec()).await.unwrap();
 
-        let mut w = c.open_write("child").await.unwrap();
-        w.write_all(b"kept").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("child", b"kept".to_vec()).await.unwrap();
 
         c.delete(None).await.unwrap();
         assert!(matches!(
-            c.open_read(None).await,
+            c.load::<Vec<u8>>(None).await,
             Err(Error::NotFound { .. })
         ));
 
-        let mut buf = Vec::new();
-        let mut r = c.open_read("child").await.unwrap();
-        r.read_to_end(&mut buf).await.unwrap();
-        drop(r);
+        let buf: Vec<u8> = c.load("child").await.unwrap();
         assert_eq!(buf, b"kept");
     });
 }
@@ -272,10 +231,7 @@ fn list_returns_keys_relative_to_the_prefix() {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("root").unwrap()).await.unwrap();
         for k in ["x", "dir/y", "dir/sub/z", "dirt/w"] {
-            let mut w = c.open_write(k).await.unwrap();
-            w.write_all(b"_").await.unwrap();
-            w.close().await.unwrap();
-            drop(w);
+            c.store(k, b"_".to_vec()).await.unwrap();
         }
 
         let keys = c.list(None).await.unwrap();
@@ -300,10 +256,7 @@ fn list_compares_whole_components() {
     block_on(async {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("root").unwrap()).await.unwrap();
-        let mut w = c.open_write("dirt/w").await.unwrap();
-        w.write_all(b"_").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("dirt/w", b"_".to_vec()).await.unwrap();
 
         assert!(c.list("dir").await.unwrap().is_empty());
     });
@@ -316,10 +269,7 @@ fn list_excludes_the_listed_key_itself() {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("root").unwrap()).await.unwrap();
         for k in ["dir", "dir/f"] {
-            let mut w = c.open_write(k).await.unwrap();
-            w.write_all(b"_").await.unwrap();
-            w.close().await.unwrap();
-            drop(w);
+            c.store(k, b"_".to_vec()).await.unwrap();
         }
 
         let keys = c.list("dir").await.unwrap();
@@ -334,7 +284,7 @@ fn invalid_string_keys_are_rejected() {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
         for bad in ["", "../x", "b//c", "CON", "-x", "bad*char"] {
-            let err = c.open_write(bad).await.err().expect(bad);
+            let err = c.store(bad, b"x".to_vec()).await.expect_err(bad);
             assert!(matches!(err, Error::Key(_)), "{bad:?}: {err:?}");
         }
     });
@@ -347,35 +297,28 @@ fn keys_past_the_depth_cap_are_rejected() {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a/b").unwrap()).await.unwrap();
         let deep = vec!["x"; MAX_DEPTH - 1].join("/");
-        let err = c.open_write(deep.as_str()).await.err().unwrap();
+        let err = c.store(deep.as_str(), b"x".to_vec()).await.err().unwrap();
         assert!(matches!(err, Error::Key(KeyError::TooDeep)), "{err:?}");
     });
 }
 
 #[test]
 fn case_collisions_are_refused() {
-    // D6: `open_write` must fail if the key differs only by ASCII case from an existing one.
+    // D6: `store` must fail if the key differs only by ASCII case from an existing one.
     block_on(async {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-        let mut w = c.open_write("Notes.md").await.unwrap();
-        w.write_all(b"x").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("Notes.md", b"x".to_vec()).await.unwrap();
 
-        assert!(c.open_write("notes.md").await.is_err());
-        assert!(c.open_write("NOTES.MD").await.is_err());
+        assert!(c.store("notes.md", b"z".to_vec()).await.is_err());
+        assert!(c.store("NOTES.MD", b"z".to_vec()).await.is_err());
+        // A refused store leaves nothing behind.
+        assert_eq!(c.list(None).await.unwrap(), [Key::new("Notes.md").unwrap()]);
 
         // The same spelling is an overwrite, not a collision.
-        let mut w = c.open_write("Notes.md").await.unwrap();
-        w.write_all(b"y").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("Notes.md", b"y".to_vec()).await.unwrap();
 
-        let mut buf = Vec::new();
-        let mut r = c.open_read("Notes.md").await.unwrap();
-        r.read_to_end(&mut buf).await.unwrap();
-        drop(r);
+        let buf: Vec<u8> = c.load("Notes.md").await.unwrap();
         assert_eq!(buf, b"y");
     });
 }
@@ -386,17 +329,11 @@ fn case_collisions_compare_the_full_key() {
     block_on(async {
         let v = Vault::new(MemoryStore::new(), MemoryClaimer::new());
         let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-        let mut w = c.open_write("Dir/f").await.unwrap();
-        w.write_all(b"x").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("Dir/f", b"x".to_vec()).await.unwrap();
 
-        assert!(c.open_write("dir/f").await.is_err());
+        assert!(c.store("dir/f", b"z".to_vec()).await.is_err());
 
-        let mut w = c.open_write("dir/g").await.unwrap();
-        w.write_all(b"y").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store("dir/g", b"y".to_vec()).await.unwrap();
     });
 }
 
@@ -410,17 +347,11 @@ fn stores_can_be_shared_between_vaults() {
         let v2 = Vault::new(store, claimer);
 
         let mut c = v1.claim(Key::new("a").unwrap()).await.unwrap();
-        let mut w = c.open_write(None).await.unwrap();
-        w.write_all(b"shared").await.unwrap();
-        w.close().await.unwrap();
-        drop(w);
+        c.store(None, b"shared".to_vec()).await.unwrap();
         c.release().unwrap();
 
         let mut c = v2.claim(Key::new("a").unwrap()).await.unwrap();
-        let mut buf = Vec::new();
-        let mut r = c.open_read(None).await.unwrap();
-        r.read_to_end(&mut buf).await.unwrap();
-        drop(r);
+        let buf: Vec<u8> = c.load(None).await.unwrap();
         assert_eq!(buf, b"shared");
     });
 }

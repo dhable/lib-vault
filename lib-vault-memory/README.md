@@ -8,21 +8,16 @@ exclusion only covers this process.
 ## Example
 
 ```rust
-use futures::{AsyncReadExt, AsyncWriteExt};
 use lib_vault::Key;
 
 # futures::executor::block_on(async {
 let vault = lib_vault_memory::vault();
 let mut claim = vault.claim(Key::new("session")?).await?;
 
-let mut writer = claim.open_write("notes.md").await?;
-writer.write_all(b"hello").await?;
-writer.close().await?; // commits
-drop(writer);
+claim.store("notes.md", b"hello".to_vec()).await?;
 
-let mut text = String::new();
-claim.open_read("notes.md").await?.read_to_string(&mut text).await?;
-assert_eq!(text, "hello");
+let bytes: Vec<u8> = claim.load("notes.md").await?;
+assert_eq!(bytes, b"hello");
 # Ok::<(), Box<dyn std::error::Error>>(())
 # }).unwrap();
 ```
@@ -40,10 +35,12 @@ let b: Vault<lib_vault::io_driver::AsyncIoDriver> = Vault::new(store, claimer);
 
 ## Behavior
 
-- **Writes commit on `close()`**, replacing the object atomically. A writer dropped without
-  `close()` discards its data.
-- **Reads** return a snapshot of the object as of `open_read`.
-- **Case collisions**: writing `notes.md` when `Notes.md` exists fails with
+- **Objects are `Vec<u8>`**: `claim.store(key, bytes)` and `claim.load::<Vec<u8>>(key)`. Any
+  other type fails with `Error::WrongType`.
+- **`store`** replaces the object atomically: it stores all of the bytes, or fails and leaves
+  the key as it was.
+- **`load`** returns a copy of the object's bytes.
+- **Case collisions**: storing `notes.md` when `Notes.md` exists fails with
   `MemoryError::CaseCollision` (wrapped in `Error::StoreError`).
 - **Exclusion** covers one `MemoryClaimer` and its clones. Separate claimers, and other
   processes, don't see each other's claims.
