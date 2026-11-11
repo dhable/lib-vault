@@ -441,11 +441,13 @@ trait using `async fn` can't be used as `dyn Trait` and can't promise its future
 An `async fn`'s `Send`-ness is inferred, so it can be lost silently (as the v6 `claim`, which
 held a `MutexGuard` across `.await`, showed); §13 asserts it.
 
-**Build status:** the workspace builds and 103 tests pass (`lib-vault`: 17 unit + 1 doc;
-`lib-vault-memory`: 41 integration + 4 doc; `lib-vault-posix`: 1 unit + 37 integration + 2 doc;
-the doc counts include each crate's README examples),
-including the compile-time `Send` checks for `AsyncIoDriver`; clippy and `cargo doc` are clean; the
-`Claim::list` example is `ignore`d. Known leftovers: a stale `REVIEW(nit)` comment above the
+**Build status:** the workspace builds and 144 tests pass without a server (`lib-vault`:
+17 unit + 1 doc; `lib-vault-memory`: 42 integration + 3 doc; `lib-vault-posix`: 1 unit + 37
+integration + 2 doc; `lib-vault-sqlite`: 1 unit + 28 integration + 1 doc;
+`lib-vault-clickhouse`: 10 unit + 1 doc; the doc counts include each crate's README
+examples), plus 29 ClickHouse integration tests against the compose server, including the
+compile-time `Send` checks; clippy and `cargo doc` are clean; the `Claim::list`, `load` and
+`store` examples are `ignore`d. Known leftovers: a stale `REVIEW(nit)` comment above the
 `try_lock` docs, and some doc-comment typos.
 
 **History.** v11 replaced the object handles (`open_read` / `open_write`, the driver's
@@ -660,7 +662,7 @@ root.
 | `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<AsyncIoDriver>`, `Vec<u8>` objects, any claimer), `FsClaimer` (`FsStore` only), `FsStoreOptions`, `Sharing`, `PosixError`; requires a tokio runtime (D56) |
 | `lib-vault-memory` | the in-memory backend for tests and getting started (D51, D87): `MemoryStore` (`Vec<u8>` objects), `MemoryClaimer`, `vault()`; integration tests in `tests/` exercise the core API against it |
 | `lib-vault-sqlite` | the SQLite backend for typed values (D78, D79): `SqliteStore<D>` and its driver `SqliteDriver<D>` over an app-supplied `Dispatcher` (the value type is the driver's object pointer, D89), `SqliteClaimer` and `SqliteClaimerOptions` (any store), `SqliteError`; sqlx, requires a tokio runtime; integration tests in `tests/sqlite/` against real database files |
-| `lib-vault-clickhouse` | the ClickHouse backend for typed values (D82, D83): `ClickhouseStore<D>` and its driver `ClickhouseDriver<D>` over an app-supplied `Dispatcher`, `ClickhouseReader`/`ClickhouseWriter`, `ClickhouseClaimer` and `ClickhouseClaimerOptions` (Keeper via `KeeperMap`, any store), `ClickhouseError`; requires a tokio runtime; integration tests behind the `integration-tests` feature, against `tests/docker/compose.yaml` |
+| `lib-vault-clickhouse` | the ClickHouse backend for typed values (D82, D83): `ClickhouseStore<D>` and its driver `ClickhouseDriver<D>` over an app-supplied `Dispatcher` (the value type is the driver's object pointer, D90), `ClickhouseClaimer` and `ClickhouseClaimerOptions` (Keeper via `KeeperMap`, any store), `ClickhouseError`; requires a tokio runtime; integration tests behind the `integration-tests` feature, against `tests/docker/compose.yaml` |
 
 Modules in `lib-vault/src/`:
 
@@ -706,8 +708,8 @@ Modules in `lib-vault-clickhouse/src/` (D82, D83):
 
 | Module | Contents |
 |---|---|
-| `lib.rs` | re-exports, crate docs with a `no_run` example and a `compile_fail` borrow check |
-| `dispatch.rs`, `driver.rs`, `handles.rs`, `store.rs` | as in `lib-vault-sqlite`, over a `clickhouse::Client` |
+| `lib.rs` | re-exports, crate docs with a `no_run` example |
+| `dispatch.rs`, `driver.rs`, `store.rs` | as in `lib-vault-sqlite`, over a `clickhouse::Client`; `store` isn't transactional |
 | `claimer.rs` | `ClickhouseClaimer`, `ClickhouseClaimerOptions`, the claim steps, and the background task (releases, lease renewal, shutdown) |
 | `protocol.rs` | the protocol's pure parts: lock plans, tokens, recognizing Keeper conflicts in server errors, root-path validation |
 | `error.rs` | `ClickhouseError` |
@@ -769,7 +771,7 @@ Modules in `lib-vault-clickhouse/src/` (D82, D83):
   - unit, no server: lock plans, token owners, Keeper conflict recognition (`Node exists`,
     `Bad version`, `No node`), root-path and lease validation, `Send`/spawnability, an
     unreachable server.
-  - integration, 30 tests against ClickHouse 26.9 with embedded Keeper
+  - integration, 29 tests against ClickHouse 26.9 with embedded Keeper
     (`tests/docker/compose.yaml`): the SQLite suite's object semantics, plus typed columns in
     `ReplacingMergeTree` tables and the `KeeperMap` case index; claims in both directions
     within and between claimers, rows in the `KeeperMap` tables, refused and cancelled claims

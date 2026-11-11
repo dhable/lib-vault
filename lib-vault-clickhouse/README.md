@@ -21,15 +21,19 @@ let vault: Vault<ClickhouseDriver<AppDispatcher>> = Vault::new(
 );
 let mut claim = vault.claim(Key::new("docs/a")?).await?;
 
-let mut writer = claim.open_write(None).await?;
-writer.put(MyDataObj { title: "hello".into() }); // impl Into<AppValue>
-writer.close().await?;                           // runs the dispatcher's write
+// Any `impl Into<AppValue>`; runs the dispatcher's `write`.
+claim.store(None, MyDataObj { title: "hello".into() }).await?;
 
-let doc: MyDataObj = claim.open_read(None).await?.try_as()?;
+// Any `TryFrom<AppValue>`. `Error::NotFound` if missing, `Error::WrongType` if the stored
+// value is another variant.
+let doc: MyDataObj = claim.load(None).await?;
 ```
 
+`AppValue` itself works in both calls too. A type with no conversion to the value type is a
+compile error, not a run-time one.
+
 The store passes keys straight through, so the dispatcher upholds the `Store` contract: full
-keys, reads see completed writes, `delete` of a missing key succeeds, `list` is
+keys, a `load` sees every `store` that has returned, `delete` of a missing key succeeds, `list` is
 component-wise and relative, and `write` refuses keys that differ from an existing one only
 by ASCII case. ClickHouse has no unique constraints or transactions: a `KeeperMap` index
 keyed by the lowercased key, written in strict mode, enforces the case rule, and each write

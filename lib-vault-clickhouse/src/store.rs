@@ -1,5 +1,5 @@
 use crate::error::dispatch_error;
-use crate::{ClickhouseDriver, ClickhouseError, ClickhouseReader, ClickhouseWriter, Dispatcher};
+use crate::{ClickhouseDriver, ClickhouseError, Dispatcher};
 use clickhouse::Client;
 use futures::future::BoxFuture;
 use lib_vault::{Error, Key, Store};
@@ -9,8 +9,9 @@ use std::sync::Arc;
 /// operation. Clones share the client and the dispatcher.
 ///
 /// The store hands the dispatcher a clone of the client with **asynchronous inserts turned
-/// off** (`async_insert = 0`), so a writer's `close` returns only once the server has written
-/// the data and a following read sees it.
+/// off** (`async_insert = 0`), so `store` returns only once the server has written the data
+/// and a following `load` sees it. ClickHouse has no transactions: a `store` that fails
+/// part-way can leave part of the dispatcher's `write` applied.
 ///
 /// Works with any claimer: [`ClickhouseClaimer`](crate::ClickhouseClaimer) for processes and
 /// servers sharing a Keeper, or e.g. `MemoryClaimer` within one process.
@@ -32,14 +33,6 @@ impl<D: Dispatcher> ClickhouseStore<D> {
             client,
             dispatcher: Arc::new(dispatcher),
         })
-    }
-
-    // Writes `value` at `key`: the writer's commit point.
-    pub(crate) async fn commit(&self, key: &Key, value: D::Value) -> Result<(), Error> {
-        self.dispatcher
-            .write(&self.client, key, value)
-            .await
-            .map_err(dispatch_error)
     }
 }
 
@@ -74,28 +67,26 @@ impl<D: Dispatcher> Store<ClickhouseDriver<D>> for ClickhouseStore<D> {
         })
     }
 
-    /// Reads the value now, so a missing key fails here with `Error::NotFound` (D43).
-    fn open_read<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<ClickhouseReader<'a, D>, Error>> {
+    /// A missing key is `Error::NotFound` (D43).
+    fn load<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<D::Value, Error>> {
         let key = key.clone();
         Box::pin(async move {
-            match self
-                .dispatcher
+            self.dispatcher
                 .read(&self.client, &key)
                 .await
                 .map_err(dispatch_error)?
-            {
-                Some(value) => Ok(ClickhouseReader::new(key, value)),
-                None => Err(Error::NotFound { key }),
-            }
+                .ok_or(Error::NotFound { key })
         })
     }
 
-    /// Nothing is written until the writer's `close`.
-    fn open_write<'a>(
-        &'a self,
-        key: &Key,
-    ) -> BoxFuture<'a, Result<ClickhouseWriter<'a, D>, Error>> {
+    /// Runs the dispatcher's `write`; the value is stored when this resolves to `Ok`.
+    fn store<'a>(&'a self, key: &Key, value: D::Value) -> BoxFuture<'a, Result<(), Error>> {
         let key = key.clone();
-        Box::pin(async move { Ok(ClickhouseWriter::new(self, key)) })
+        Box::pin(async move {
+            self.dispatcher
+                .write(&self.client, &key, value)
+                .await
+                .map_err(dispatch_error)
+        })
     }
 }

@@ -5,8 +5,8 @@
 //! As with `lib-vault-sqlite`, the app supplies a [`Dispatcher`]: one value type for the
 //! vault (usually an enum with a variant per struct) and the code that reads, writes,
 //! deletes and lists those values with a [`clickhouse::Client`], in whatever table schema
-//! suits them. The store calls it for every operation, and `Claim` passes the typed handles
-//! through untouched.
+//! suits them. The store calls it for every operation, and `Claim::store` and `Claim::load`
+//! take the app's own types.
 //!
 //! Requires a **tokio** runtime (the `clickhouse` client is built on hyper and tokio). The
 //! claimer also needs the server to have Keeper configured (`<zookeeper>` and
@@ -116,26 +116,13 @@
 //! );
 //! let mut claim = vault.claim(Key::new("docs/a")?).await?;
 //!
-//! let mut writer = claim.open_write(None).await?;
-//! writer.put(MyDataObj { title: "hello".into() });
-//! writer.close().await?; // commits
+//! // Any type with `Into<AppValue>`; runs the dispatcher's `write`.
+//! claim.store(None, MyDataObj { title: "hello".into() }).await?;
 //!
-//! let reader = claim.open_read(None).await?;
-//! let doc: MyDataObj = reader.try_as()?;
+//! // Any type with `TryFrom<AppValue>`; `Error::WrongType` if the value is another variant.
+//! let doc: MyDataObj = claim.load(None).await?;
 //! assert_eq!(doc.title, "hello");
 //! # Ok(())
-//! # }
-//! ```
-//!
-//! Handles borrow the claim, so a claim can't be released while one is open (D42):
-//!
-//! ```compile_fail
-//! # use lib_vault::Claim;
-//! # use lib_vault_clickhouse::{ClickhouseDriver, Dispatcher};
-//! # async fn f<D: Dispatcher>(mut claim: Claim<ClickhouseDriver<D>>) {
-//! let reader = claim.open_read(None).await.unwrap();
-//! claim.release().unwrap(); // error: `claim` is still borrowed by `reader`
-//! drop(reader);
 //! # }
 //! ```
 
@@ -143,7 +130,6 @@ mod claimer;
 mod dispatch;
 mod driver;
 mod error;
-mod handles;
 mod protocol;
 mod store;
 
@@ -151,7 +137,6 @@ pub use claimer::{ClickhouseClaimer, ClickhouseClaimerOptions};
 pub use dispatch::{DispatchError, Dispatcher};
 pub use driver::ClickhouseDriver;
 pub use error::ClickhouseError;
-pub use handles::{ClickhouseReader, ClickhouseWriter};
 pub use store::ClickhouseStore;
 
 #[cfg(test)]
@@ -196,7 +181,7 @@ mod tests {
         fn assert_send_value<T: Send>(_: &T) {}
         fn spawnable<F: Future + Send + 'static>(_: F) {}
 
-        fn checks<D: Dispatcher>(vault: Vault<ClickhouseDriver<D>>) {
+        fn checks<D: Dispatcher>(vault: Vault<ClickhouseDriver<D>>, value: D::Value) {
             assert_send::<Claim<ClickhouseDriver<D>>>();
             assert_vault::<Vault<ClickhouseDriver<D>>>();
             assert_send_value(&vault.claim(Key::new("a").unwrap()));
@@ -204,10 +189,8 @@ mod tests {
             spawnable(async move {
                 let mut c = vault.claim(Key::new("a").unwrap()).await.unwrap();
                 let _ = c.list(None).await;
-                if let Ok(w) = c.open_write("x").await {
-                    let _ = w.close().await;
-                }
-                drop(c.open_read("x").await);
+                let _ = c.store("x", value).await;
+                let _ = c.load::<D::Value>("x").await;
             });
         }
         let _ = checks::<NoDispatcher>;

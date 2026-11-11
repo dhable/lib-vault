@@ -30,7 +30,8 @@ pub type DispatchError = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// Every method receives the store's client, and its future must be `Send`.
 pub trait Dispatcher: Send + Sync + 'static {
-    /// The values this vault stores.
+    /// The values this vault stores. `claim.store` and `claim.load` take this type, or any
+    /// type with `Into<Value>` and `TryFrom<Value>` conversions.
     type Value: Send + 'static;
 
     /// Creates or upgrades the app's tables. Run once by

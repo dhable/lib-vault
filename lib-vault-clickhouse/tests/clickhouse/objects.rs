@@ -1,5 +1,5 @@
 //! Typed values through a `Claim`: the `Store` contract (design §5, D40, D43, D48), scoping
-//! (D36), the case rule (D6) and the ClickHouse handles, against a live server.
+//! (D36), the case rule (D6) and typed `load`/`store` (D82, D90), against a live server.
 
 use crate::app::{AppDispatcher, AppValue, CaseCollision, Doc, User};
 use crate::fresh_database;
@@ -29,20 +29,18 @@ async fn write_then_read_round_trips() {
         title: "Hello".into(),
         body: "world".into(),
     };
-    let mut w = c.open_write(None).await.unwrap();
-    w.put(doc.clone());
-    w.close().await.unwrap();
+    c.store(None, doc.clone()).await.unwrap();
 
-    // As one of the app's types.
-    let r = c.open_read(None).await.unwrap();
-    assert_eq!(r.key(), &Key::new("docs/a").unwrap());
-    let read: Doc = r.try_as().unwrap();
+    // As one of the app's types (`TryFrom<AppValue>`).
+    let read: Doc = c.load(None).await.unwrap();
     assert_eq!(read, doc);
 
-    // As the dispatcher's value type.
-    let r = c.open_read(None).await.unwrap();
-    assert_eq!(r.value(), &AppValue::Doc(doc.clone()));
-    assert_eq!(r.into_value(), AppValue::Doc(doc));
+    // As the dispatcher's value type, for both `load` and `store`.
+    let value: AppValue = c.load(None).await.unwrap();
+    assert_eq!(value, AppValue::Doc(doc.clone()));
+    c.store(None, value).await.unwrap();
+    let read: Doc = c.load(None).await.unwrap();
+    assert_eq!(read, doc);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -62,19 +60,25 @@ async fn values_are_rows_in_the_apps_tables() {
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("team").unwrap()).await.unwrap();
 
-    let mut w = c.open_write("readme").await.unwrap();
-    w.put(Doc {
-        title: "About".into(),
-        body: "We build vaults.".into(),
-    });
-    w.close().await.unwrap();
+    c.store(
+        "readme",
+        Doc {
+            title: "About".into(),
+            body: "We build vaults.".into(),
+        },
+    )
+    .await
+    .unwrap();
 
-    let mut w = c.open_write("people/ada").await.unwrap();
-    w.put(User {
-        name: "Ada".into(),
-        age: 36,
-    });
-    w.close().await.unwrap();
+    c.store(
+        "people/ada",
+        User {
+            name: "Ada".into(),
+            age: 36,
+        },
+    )
+    .await
+    .unwrap();
 
     let (title, body) = client
         .query("SELECT title, body FROM docs FINAL WHERE key = 'team/readme'")
@@ -130,19 +134,22 @@ async fn key_forms_and_none_name_the_same_value() {
     let v = Vault::new(store, claimer);
 
     let mut c = v.claim(Key::new("x/y").unwrap()).await.unwrap();
-    let mut w = c.open_write(None).await.unwrap();
-    w.put(User {
-        name: "self".into(),
-        age: 1,
-    });
-    w.close().await.unwrap();
+    c.store(
+        None,
+        User {
+            name: "self".into(),
+            age: 1,
+        },
+    )
+    .await
+    .unwrap();
     c.release().unwrap();
 
     let mut parent = v.claim(Key::new("x").unwrap()).await.unwrap();
     let y = Key::new("y").unwrap();
-    let by_str: User = parent.open_read("y").await.unwrap().try_as().unwrap();
-    let by_key: User = parent.open_read(&y).await.unwrap().try_as().unwrap();
-    let by_option: User = parent.open_read(Some(&y)).await.unwrap().try_as().unwrap();
+    let by_str: User = parent.load("y").await.unwrap();
+    let by_key: User = parent.load(&y).await.unwrap();
+    let by_option: User = parent.load(Some(&y)).await.unwrap();
     assert_eq!(by_str.name, "self");
     assert_eq!(by_key, by_str);
     assert_eq!(by_option, by_str);
@@ -150,7 +157,7 @@ async fn key_forms_and_none_name_the_same_value() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reading_a_missing_value_reports_the_full_key() {
-    // D43: `open_read` of a missing key is an error, at open time.
+    // D43: `load` of a missing key is an error.
     let (client, db) = fresh_database().await;
     let root = format!("/lib_vault_tests/{db}");
     let store = ClickhouseStore::new(client.clone(), AppDispatcher::new(&root))
@@ -165,7 +172,7 @@ async fn reading_a_missing_value_reports_the_full_key() {
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-    match c.open_read("missing").await.err() {
+    match c.load::<AppValue>("missing").await.err() {
         Some(Error::NotFound { key }) => assert_eq!(key, Key::new("a/missing").unwrap()),
         other => panic!("expected NotFound, got {other:?}"),
     }
@@ -187,76 +194,29 @@ async fn reading_as_the_wrong_type_is_refused() {
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-    let mut w = c.open_write("u").await.unwrap();
-    w.put(User {
-        name: "Ada".into(),
-        age: 36,
-    });
-    w.close().await.unwrap();
-
-    let err = c.open_read("u").await.unwrap().try_as::<Doc>().unwrap_err();
-    let Error::StoreError(source) = &err else {
-        panic!("expected a store error, got {err:?}");
-    };
-    match source.downcast_ref::<ClickhouseError>() {
-        Some(ClickhouseError::WrongType { key }) => assert_eq!(*key, Key::new("a/u").unwrap()),
-        other => panic!("expected WrongType, got {other:?}"),
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn writes_commit_on_close() {
-    // D43: the commit point is `close()`. Dropping the writer, or closing it without a
-    // `put`, leaves the key as it was; the last `put` wins.
-    let (client, db) = fresh_database().await;
-    let root = format!("/lib_vault_tests/{db}");
-    let store = ClickhouseStore::new(client.clone(), AppDispatcher::new(&root))
-        .await
-        .unwrap();
-    let claimer = ClickhouseClaimer::with_options(
-        client,
-        ClickhouseClaimerOptions::default().root_path(&root),
+    c.store(
+        "u",
+        User {
+            name: "Ada".into(),
+            age: 36,
+        },
     )
     .await
     .unwrap();
-    let v = Vault::new(store, claimer);
-    let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-    let mut w = c.open_write("f").await.unwrap();
-    w.put(Doc {
-        title: "never".into(),
-        body: "committed".into(),
-    });
-    drop(w);
-    assert!(matches!(
-        c.open_read("f").await,
-        Err(Error::NotFound { .. })
-    ));
-
-    let w = c.open_write("f").await.unwrap();
-    w.close().await.unwrap();
-    assert!(matches!(
-        c.open_read("f").await,
-        Err(Error::NotFound { .. })
-    ));
-
-    let mut w = c.open_write("f").await.unwrap();
-    w.put(Doc {
-        title: "first".into(),
-        body: String::new(),
-    });
-    w.put(Doc {
-        title: "second".into(),
-        body: String::new(),
-    });
-    w.close().await.unwrap();
-    let doc: Doc = c.open_read("f").await.unwrap().try_as().unwrap();
-    assert_eq!(doc.title, "second");
+    // D86: a value of another variant is `WrongType`, with the full key.
+    match c.load::<Doc>("u").await.err() {
+        Some(Error::WrongType { key }) => assert_eq!(key, Key::new("a/u").unwrap()),
+        other => panic!("expected WrongType, got {other:?}"),
+    }
+    // The value is still there, as its own type.
+    let user: User = c.load("u").await.unwrap();
+    assert_eq!(user.name, "Ada");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn overwriting_replaces_the_value_and_its_type() {
-    // D43: `open_write` creates or overwrites, here with a value of another kind; repeated
+    // D43: `store` creates or overwrites, here with a value of another kind; repeated
     // overwrites of one kind always read back the latest.
     let (client, db) = fresh_database().await;
     let root = format!("/lib_vault_tests/{db}");
@@ -273,24 +233,30 @@ async fn overwriting_replaces_the_value_and_its_type() {
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
     for round in 0..5 {
-        let mut w = c.open_write("f").await.unwrap();
-        w.put(Doc {
-            title: format!("doc {round}"),
-            body: String::new(),
-        });
-        w.close().await.unwrap();
-        let doc: Doc = c.open_read("f").await.unwrap().try_as().unwrap();
+        c.store(
+            "f",
+            Doc {
+                title: format!("doc {round}"),
+                body: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let doc: Doc = c.load("f").await.unwrap();
         assert_eq!(doc.title, format!("doc {round}"));
     }
 
-    let mut w = c.open_write("f").await.unwrap();
-    w.put(User {
-        name: "now a user".into(),
-        age: 7,
-    });
-    w.close().await.unwrap();
+    c.store(
+        "f",
+        User {
+            name: "now a user".into(),
+            age: 7,
+        },
+    )
+    .await
+    .unwrap();
 
-    let user: User = c.open_read("f").await.unwrap().try_as().unwrap();
+    let user: User = c.load("f").await.unwrap();
     assert_eq!(user.name, "now a user");
     let docs = client
         .query("SELECT count() FROM docs FINAL")
@@ -318,31 +284,37 @@ async fn delete_semantics() {
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-    let mut w = c.open_write(None).await.unwrap();
-    w.put(Doc {
-        title: "self".into(),
-        body: String::new(),
-    });
-    w.close().await.unwrap();
+    c.store(
+        None,
+        Doc {
+            title: "self".into(),
+            body: String::new(),
+        },
+    )
+    .await
+    .unwrap();
 
-    let mut w = c.open_write("child").await.unwrap();
-    w.put(User {
-        name: "kept".into(),
-        age: 1,
-    });
-    w.close().await.unwrap();
+    c.store(
+        "child",
+        User {
+            name: "kept".into(),
+            age: 1,
+        },
+    )
+    .await
+    .unwrap();
 
     c.delete(None).await.unwrap();
     assert!(matches!(
-        c.open_read(None).await,
+        c.load::<AppValue>(None).await,
         Err(Error::NotFound { .. })
     ));
-    let kept: User = c.open_read("child").await.unwrap().try_as().unwrap();
+    let kept: User = c.load("child").await.unwrap();
     assert_eq!(kept.name, "kept");
 
     c.delete("child").await.unwrap();
     assert!(matches!(
-        c.open_read("child").await,
+        c.load::<AppValue>("child").await,
         Err(Error::NotFound { .. })
     ));
     c.delete("missing").await.unwrap();
@@ -372,12 +344,15 @@ async fn list_returns_relative_keys_by_whole_components() {
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("root").unwrap()).await.unwrap();
     for k in ["x", "dir", "dir/y", "dir/sub/z", "dirt/w"] {
-        let mut w = c.open_write(k).await.unwrap();
-        w.put(Doc {
-            title: k.into(),
-            body: String::new(),
-        });
-        w.close().await.unwrap();
+        c.store(
+            k,
+            Doc {
+                title: k.into(),
+                body: String::new(),
+            },
+        )
+        .await
+        .unwrap();
     }
 
     let keys = c.list(None).await.unwrap();
@@ -412,17 +387,21 @@ async fn claims_only_see_their_own_subtree() {
     let v = Vault::new(store, claimer);
 
     let mut outside = v.claim(Key::new("b").unwrap()).await.unwrap();
-    let mut w = outside.open_write(None).await.unwrap();
-    w.put(Doc {
-        title: "outside".into(),
-        body: String::new(),
-    });
-    w.close().await.unwrap();
+    outside
+        .store(
+            None,
+            Doc {
+                title: "outside".into(),
+                body: String::new(),
+            },
+        )
+        .await
+        .unwrap();
     outside.release().unwrap();
 
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
     assert!(matches!(
-        c.open_read("b").await,
+        c.load::<AppValue>("b").await,
         Err(Error::NotFound { .. })
     ));
     assert!(c.list(None).await.unwrap().is_empty());
@@ -446,19 +425,21 @@ async fn case_collisions_are_refused() {
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-    let mut w = c.open_write("Notes").await.unwrap();
-    w.put(Doc {
-        title: "original".into(),
-        body: String::new(),
-    });
-    w.close().await.unwrap();
+    c.store(
+        "Notes",
+        Doc {
+            title: "original".into(),
+            body: String::new(),
+        },
+    )
+    .await
+    .unwrap();
 
-    let mut w = c.open_write("notes").await.unwrap();
-    w.put(Doc {
+    let collides = Doc {
         title: "collides".into(),
         body: String::new(),
-    });
-    let err = w.close().await.unwrap_err();
+    };
+    let err = c.store("notes", collides).await.unwrap_err();
     let Error::StoreError(source) = &err else {
         panic!("expected a store error, got {err:?}");
     };
@@ -468,20 +449,23 @@ async fn case_collisions_are_refused() {
     let collision = cause.downcast_ref::<CaseCollision>().unwrap();
     assert_eq!(collision.existing, "a/Notes");
 
-    let doc: Doc = c.open_read("Notes").await.unwrap().try_as().unwrap();
+    let doc: Doc = c.load("Notes").await.unwrap();
     assert_eq!(doc.title, "original");
     assert!(matches!(
-        c.open_read("notes").await,
+        c.load::<AppValue>("notes").await,
         Err(Error::NotFound { .. })
     ));
 
     // The same spelling is an overwrite, not a collision.
-    let mut w = c.open_write("Notes").await.unwrap();
-    w.put(Doc {
-        title: "updated".into(),
-        body: String::new(),
-    });
-    w.close().await.unwrap();
+    c.store(
+        "Notes",
+        Doc {
+            title: "updated".into(),
+            body: String::new(),
+        },
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -507,7 +491,7 @@ async fn dispatcher_errors_reach_the_caller() {
         .unwrap();
 
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-    let err = c.open_read("odd").await.err().unwrap();
+    let err = c.load::<AppValue>("odd").await.err().unwrap();
     let Error::StoreError(source) = &err else {
         panic!("expected a store error, got {err:?}");
     };
@@ -534,12 +518,15 @@ async fn values_persist_across_clients() {
     .unwrap();
     let v = Vault::new(store, claimer.clone());
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-    let mut w = c.open_write(None).await.unwrap();
-    w.put(Doc {
-        title: "durable".into(),
-        body: String::new(),
-    });
-    w.close().await.unwrap();
+    c.store(
+        None,
+        Doc {
+            title: "durable".into(),
+            body: String::new(),
+        },
+    )
+    .await
+    .unwrap();
     c.release().unwrap();
     v.shutdown().await;
     claimer.shutdown().await.unwrap();
@@ -556,7 +543,7 @@ async fn values_persist_across_clients() {
     .unwrap();
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-    let doc: Doc = c.open_read(None).await.unwrap().try_as().unwrap();
+    let doc: Doc = c.load(None).await.unwrap();
     assert_eq!(doc.title, "durable");
 }
 
@@ -584,12 +571,15 @@ async fn concurrent_writers_on_one_server() {
                     .await
                     .unwrap();
                 for round in 0..5 {
-                    let mut w = c.open_write(None).await.unwrap();
-                    w.put(User {
-                        name: format!("item {i}"),
-                        age: round,
-                    });
-                    w.close().await.unwrap();
+                    c.store(
+                        None,
+                        User {
+                            name: format!("item {i}"),
+                            age: round,
+                        },
+                    )
+                    .await
+                    .unwrap();
                 }
             })
         })
@@ -600,7 +590,7 @@ async fn concurrent_writers_on_one_server() {
 
     let mut c = v.claim(Key::new("items").unwrap()).await.unwrap();
     assert_eq!(c.list(None).await.unwrap().len(), 16);
-    let last: User = c.open_read("3").await.unwrap().try_as().unwrap();
+    let last: User = c.load("3").await.unwrap();
     assert_eq!(last.age, 4);
 }
 
@@ -615,13 +605,16 @@ async fn the_store_works_with_any_claimer() {
     let v = Vault::new(store, MemoryClaimer::new());
 
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-    let mut w = c.open_write("f").await.unwrap();
-    w.put(Doc {
-        title: "memory-claimed".into(),
-        body: String::new(),
-    });
-    w.close().await.unwrap();
-    let doc: Doc = c.open_read("f").await.unwrap().try_as().unwrap();
+    c.store(
+        "f",
+        Doc {
+            title: "memory-claimed".into(),
+            body: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let doc: Doc = c.load("f").await.unwrap();
     assert_eq!(doc.title, "memory-claimed");
     assert!(matches!(
         v.claim(Key::new("a/f").unwrap()).await,
