@@ -1,5 +1,5 @@
 use crate::DispatchError;
-use lib_vault::{Error, Key};
+use lib_vault::Error;
 
 /// Errors specific to the SQLite backend. They reach callers wrapped in
 /// `lib_vault::Error::StoreError` or `Error::ClaimError`.
@@ -11,9 +11,6 @@ pub enum SqliteError {
 
     #[error("dispatcher error")]
     Dispatch(#[source] DispatchError),
-
-    #[error("the value at {key} isn't the requested type")]
-    WrongType { key: Key },
 
     #[error("the sqlite claimer has been shut down")]
     ClaimerShutDown,

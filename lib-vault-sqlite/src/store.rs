@@ -1,5 +1,5 @@
 use crate::error::{dispatch_error, store_error};
-use crate::{Dispatcher, SqliteDriver, SqliteError, SqliteReader, SqliteWriter};
+use crate::{Dispatcher, SqliteDriver, SqliteError};
 use futures::future::BoxFuture;
 use lib_vault::{Error, Key, Store};
 use sqlx::sqlite::SqlitePool;
@@ -8,9 +8,10 @@ use std::sync::Arc;
 /// A `Store` that keeps typed values in SQLite, using the app's [`Dispatcher`] for every
 /// operation. Clones share the pool and the dispatcher.
 ///
-/// Reads run on a pooled connection; writes and deletes run in a `BEGIN IMMEDIATE`
-/// transaction, so they take SQLite's write lock up front instead of failing to upgrade
-/// a read lock part-way through.
+/// `load` and `list` run on a pooled connection; `store` and `delete` run in a `BEGIN
+/// IMMEDIATE` transaction, so they take SQLite's write lock up front instead of failing to
+/// upgrade a read lock part-way through. A `store` is atomic: the dispatcher's `write` is
+/// committed whole, or rolled back if it fails or the future is dropped.
 ///
 /// Works with any claimer: [`SqliteClaimer`](crate::SqliteClaimer) for processes sharing the
 /// database file, or e.g. `MemoryClaimer` within one process.
@@ -36,8 +37,8 @@ impl<D: Dispatcher> SqliteStore<D> {
         })
     }
 
-    // Writes `value` at `key` in one transaction: the writer's commit point.
-    pub(crate) async fn commit(&self, key: &Key, value: D::Value) -> Result<(), Error> {
+    // Writes `value` at `key` in one transaction.
+    async fn commit(&self, key: &Key, value: D::Value) -> Result<(), Error> {
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -89,26 +90,22 @@ impl<D: Dispatcher> Store<SqliteDriver<D>> for SqliteStore<D> {
         })
     }
 
-    /// Reads the value now, so a missing key fails here with `Error::NotFound` (D43).
-    fn open_read<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<SqliteReader<'a, D>, Error>> {
+    /// A missing key is `Error::NotFound` (D43).
+    fn load<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<D::Value, Error>> {
         let key = key.clone();
         Box::pin(async move {
             let mut conn = self.pool.acquire().await.map_err(store_error)?;
-            match self
-                .dispatcher
+            self.dispatcher
                 .read(&mut conn, &key)
                 .await
                 .map_err(dispatch_error)?
-            {
-                Some(value) => Ok(SqliteReader::new(key, value)),
-                None => Err(Error::NotFound { key }),
-            }
+                .ok_or(Error::NotFound { key })
         })
     }
 
-    /// Nothing is written until the writer's `close`.
-    fn open_write<'a>(&'a self, key: &Key) -> BoxFuture<'a, Result<SqliteWriter<'a, D>, Error>> {
+    /// Runs the dispatcher's `write`; the value is stored when this resolves to `Ok`.
+    fn store<'a>(&'a self, key: &Key, value: D::Value) -> BoxFuture<'a, Result<(), Error>> {
         let key = key.clone();
-        Box::pin(async move { Ok(SqliteWriter::new(self, key)) })
+        Box::pin(async move { self.commit(&key, value).await })
     }
 }
