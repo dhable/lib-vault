@@ -20,7 +20,7 @@ use std::sync::Arc;
 /// - at most [`MAX_COMPONENT_LEN`] bytes.
 ///
 /// A key has at most [`MAX_DEPTH`] components and [`MAX_KEY_LEN`] bytes. Stores also refuse to
-/// create a key that differs only by ASCII case from an existing one (see `Store::open_write`).
+/// create a key that differs only by ASCII case from an existing one (see `Store::store`).
 ///
 /// Cloning is cheap (an `Arc<str>` refcount bump), so implementations can clone a `&Key`
 /// into a `'static` future instead of borrowing it.

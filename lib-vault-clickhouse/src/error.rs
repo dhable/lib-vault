@@ -12,9 +12,6 @@ pub enum ClickhouseError {
     #[error("dispatcher error")]
     Dispatch(#[source] DispatchError),
 
-    #[error("the value at {key} isn't the requested type")]
-    WrongType { key: Key },
-
     #[error("the clickhouse claimer has been shut down")]
     ClaimerShutDown,
 
