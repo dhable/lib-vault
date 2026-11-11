@@ -15,6 +15,9 @@ pub enum Error {
     #[error("no object at {key}")]
     NotFound { key: Key },
 
+    #[error("the object at {key} isn't the requested type")]
+    WrongType { key: Key },
+
     #[error("error obtaining a claim")]
     ClaimError(#[source] Box<dyn std::error::Error + Send + Sync>),
 

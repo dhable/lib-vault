@@ -13,11 +13,14 @@ pub trait Store<D: io_driver::IoDriver>: 'static {
     /// Deletes the object at `key`. Succeeds if there is no such object.
     fn delete<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<(), Error>>;
 
-    /// Opens the object at `key` for reading. Errors if there is no such object.
-    fn open_read<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<D::Reader<'a>, Error>>;
+    /// Loads the whole object at `key`. Errors with `Error::NotFound` if there is no such
+    /// object. A shared pointer (`Arc`, `Rc`) must be uniquely owned: the caller takes the
+    /// object out of it, so don't hand out a clone of a pointer the store keeps.
+    fn load<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<D::ObjectPtr, Error>>;
 
-    /// Opens the object at `key` for writing, creating or overwriting it. Implementations
-    /// document when written data is committed (e.g. on `close()`). Must fail if `key` differs
+    /// Stores `data` as the whole object at `key`, creating or overwriting it. Implementations
+    /// document whether a failed or interrupted call can leave a partial object. Must fail with
+    /// `Error::WrongType` if `data` isn't a type the store holds, and must fail if `key` differs
     /// only by ASCII case from an existing object's key, so `Foo` and `foo` never coexist.
-    fn open_write<'a>(&'a self, key: &Key) -> D::Fut<'a, Result<D::Writer<'a>, Error>>;
+    fn store<'a>(&'a self, key: &Key, data: D::ObjectPtr) -> D::Fut<'a, Result<(), Error>>;
 }

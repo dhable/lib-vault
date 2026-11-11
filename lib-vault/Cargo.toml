@@ -11,7 +11,6 @@ readme = "README.md"
 tracing.workspace = true
 futures.workspace = true
 thiserror.workspace = true
-bytes.workspace = true
 
 [dev-dependencies]
 lib-vault-memory.workspace = true

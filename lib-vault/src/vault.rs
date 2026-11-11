@@ -97,11 +97,13 @@ impl<D: io_driver::IoDriver> Clone for Vault<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io_driver::async_io::{ObjectReader, ObjectWriter};
+    use crate::io_driver::IoDriver;
     use crate::{ClaimLock, Store};
     use futures::FutureExt;
     use futures::future::{self, BoxFuture};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    type ObjectPtr = <io_driver::AsyncIoDriver as IoDriver>::ObjectPtr;
 
     // A store the claim never uses in these tests.
     struct NullStore;
@@ -113,10 +115,10 @@ mod tests {
         fn delete<'a>(&'a self, _: &Key) -> BoxFuture<'a, Result<(), Error>> {
             Box::pin(future::ready(Ok(())))
         }
-        fn open_read<'a>(&'a self, k: &Key) -> BoxFuture<'a, Result<ObjectReader<'a>, Error>> {
+        fn load<'a>(&'a self, k: &Key) -> BoxFuture<'a, Result<ObjectPtr, Error>> {
             Box::pin(future::ready(Err(Error::NotFound { key: k.clone() })))
         }
-        fn open_write<'a>(&'a self, k: &Key) -> BoxFuture<'a, Result<ObjectWriter<'a>, Error>> {
+        fn store<'a>(&'a self, k: &Key, _: ObjectPtr) -> BoxFuture<'a, Result<(), Error>> {
             Box::pin(future::ready(Err(Error::NotFound { key: k.clone() })))
         }
     }
