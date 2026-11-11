@@ -13,8 +13,7 @@ futures.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rustix.workspace = true
-tokio = { workspace = true, features = ["rt", "fs"] }
-tokio-util = { workspace = true, features = ["compat"] }
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process"] }

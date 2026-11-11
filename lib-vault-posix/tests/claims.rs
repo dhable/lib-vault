@@ -1,7 +1,6 @@
 //! Claim exclusion with lock files (D16, D44, D59, D67): within a process, between independent
 //! stores on one root, and between processes.
 
-use futures::{AsyncReadExt, AsyncWriteExt};
 use lib_vault::{Error, Key, Vault, io_driver::AsyncIoDriver};
 use lib_vault_posix::{FsClaimer, FsStore, FsStoreOptions};
 use std::io::{BufRead, BufReader};
@@ -74,19 +73,13 @@ async fn a_claimed_key_can_be_written_by_its_holder_only() {
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("doc").unwrap()).await.unwrap();
 
-    let mut w = c.open_write(None).await.unwrap();
-    w.write_all(b"mine").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store(None, b"mine".to_vec()).await.unwrap();
 
     assert!(refused(&v, "doc").await);
     c.release().unwrap();
 
     let mut c = v.claim(Key::new("doc").unwrap()).await.unwrap();
-    let mut buf = Vec::new();
-    let mut r = c.open_read(None).await.unwrap();
-    r.read_to_end(&mut buf).await.unwrap();
-    drop(r);
+    let buf: Vec<u8> = c.load(None).await.unwrap();
     assert_eq!(buf, b"mine");
 }
 

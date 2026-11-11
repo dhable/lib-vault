@@ -1,8 +1,8 @@
 //! The write journal's on-disk format (D63).
 //!
 //! A journal is `.vault-journal-<name>` beside the object: a 32-byte header followed by the
-//! object's complete new content. While writing, the header is all zeros; `close()` fills it
-//! in, marking the journal complete:
+//! object's complete new content. While writing, the header is all zeros; `store` fills it in
+//! once the content is written, marking the journal complete:
 //!
 //! | bytes  | field                                   |
 //! |--------|-----------------------------------------|
@@ -16,7 +16,7 @@
 //! object and can be copied over it by hand; an incomplete one can be deleted.
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::fs::FileExt;
 
 pub(crate) const HEADER_LEN: usize = 32;
@@ -37,21 +37,7 @@ pub(crate) fn complete(file: &File, len: u64, crc: u32) -> io::Result<()> {
     file.write_all_at(&header, 0)
 }
 
-/// Copies the journal's content into `object`.
-pub(crate) fn copy_content(journal: &File, object: &mut File) -> io::Result<()> {
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut offset = HEADER_LEN as u64;
-    loop {
-        let n = journal.read_at(&mut buf, offset)?;
-        if n == 0 {
-            return Ok(());
-        }
-        object.write_all(&buf[..n])?;
-        offset += n as u64;
-    }
-}
-
-/// CRC-32 (IEEE 802.3), computed bitwise: journals are checksummed once per write, so speed
+/// CRC-32 (IEEE 802.3), computed bitwise: journals are checksummed once per `store`, so speed
 /// isn't critical, and it avoids a dependency.
 pub(crate) struct Crc32(u32);
 

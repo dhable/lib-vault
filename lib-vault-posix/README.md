@@ -13,7 +13,6 @@ and processes on one host.
 ## Example
 
 ```rust,no_run
-use futures::{AsyncReadExt, AsyncWriteExt};
 use lib_vault::{Key, Vault};
 use lib_vault_posix::{FsClaimer, FsStore, FsStoreOptions};
 
@@ -23,13 +22,10 @@ let claimer = FsClaimer::new(&store); // or any other `Claimer`
 let vault = Vault::new(store, claimer);
 let mut claim = vault.claim(Key::new("session")?).await?;
 
-let mut writer = claim.open_write("notes.md").await?;
-writer.write_all(b"hello").await?;
-writer.close().await?; // the commit point
-drop(writer);
+claim.store("notes.md", b"hello".to_vec()).await?; // journaled, then committed
 
-let mut text = String::new();
-claim.open_read("notes.md").await?.read_to_string(&mut text).await?;
+let bytes: Vec<u8> = claim.load("notes.md").await?;
+assert_eq!(bytes, b"hello");
 claim.release()?;
 # Ok(()) }
 ```
@@ -52,7 +48,7 @@ each other's claims, and this isn't detected.
 | `FsStoreOptions` | Default | Effect |
 |---|---|---|
 | `sharing(Sharing)` | `Private` | `Private`: root `0700`, files `0600`, owned by the euid. `Group(gid)`: root `2770` (setgid), files `0660`, for apps running as different uids. |
-| `journaling(bool)` | `true` | Write through a journal so a crash never leaves a partial object. Costs ~2× bytes written. |
+| `journaling(bool)` | `true` | `store` writes through a journal so a crash never leaves a partial object. Costs ~2× bytes written. |
 | `strict_modes(bool)` | `true` | sshd-style check that no ancestor of the root is writable by others. |
 | `max_verify_retries(u32)` | `3` | Retries when a lock file changes while being locked; `0` fails on the first change. |
 
@@ -71,7 +67,11 @@ each other's claims, and this isn't detected.
 - Lock and journal files use the reserved `.vault` prefix: never valid keys, never listed.
 - Lock files exist only with `FsClaimer`: a claim takes shared `flock`s on its ancestors' lock
   files and an exclusive one on its own.
-- Objects are created on the first write; claiming a missing key creates no object.
+- Objects are `Vec<u8>`: `claim.store(key, bytes)` and `claim.load::<Vec<u8>>(key)`. Any other
+  type fails with `Error::WrongType`.
+- Objects are created by the first `store`; claiming a missing key creates no object.
+- A `store` runs as one task on tokio's blocking pool. Dropping its future doesn't cancel it:
+  the write still completes.
 - Names too long for a lock or journal file name are hashed (`.vault-lock-#<hash>`).
 
 ## Safety
@@ -86,7 +86,7 @@ each other's claims, and this isn't detected.
 
 ## Recovering an interrupted write
 
-If a process dies mid-commit, the journal stays and `open_read`/`open_write` on that key fail
+If a process dies mid-commit, the journal stays and `load`/`store` on that key fail
 with `PosixError::InterruptedWrite { key, journal }`. Other keys are unaffected. Fix by hand:
 
 - **Complete journal** (header starts with `LVJRNL01`; its length and CRC-32 match the

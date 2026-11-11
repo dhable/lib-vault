@@ -1,7 +1,6 @@
 //! `FsStore` works with any `Claimer` (D75): here a `MemoryClaimer`, standing in for a
 //! distributed claimer. The store must not rely on anything `FsClaimer` does.
 
-use futures::{AsyncReadExt, AsyncWriteExt};
 use lib_vault::{Error, Key, Vault, io_driver::AsyncIoDriver};
 use lib_vault_memory::MemoryClaimer;
 use lib_vault_posix::{FsStore, FsStoreOptions};
@@ -38,21 +37,15 @@ async fn objects_work_without_fs_claimer() {
     let mut c = vault.claim(Key::new("a/b").unwrap()).await.unwrap();
 
     // The store creates its own directories.
-    let mut w = c.open_write("deep/f").await.unwrap();
-    w.write_all(b"data").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store("deep/f", b"data".to_vec()).await.unwrap();
 
-    let mut buf = Vec::new();
-    let mut r = c.open_read("deep/f").await.unwrap();
-    r.read_to_end(&mut buf).await.unwrap();
-    drop(r);
+    let buf: Vec<u8> = c.load("deep/f").await.unwrap();
     assert_eq!(buf, b"data");
     let keys = c.list(None).await.unwrap();
     assert_eq!(keys.iter().map(Key::as_str).collect::<Vec<_>>(), ["deep/f"]);
     c.delete("deep/f").await.unwrap();
     assert!(matches!(
-        c.open_read("deep/f").await,
+        c.load::<Vec<u8>>("deep/f").await,
         Err(Error::NotFound { .. })
     ));
     c.release().unwrap();
