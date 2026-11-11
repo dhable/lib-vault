@@ -21,11 +21,12 @@ pub type DispatchError = Box<dyn std::error::Error + Send + Sync>;
 ///   never the key itself (D40).
 /// - `write` must **refuse a key that differs only by ASCII case** from an existing one, so
 ///   `Foo` and `foo` never coexist (D6).
-/// - `write` runs **inside a transaction** that the store commits when the writer is closed.
+/// - `write` runs **inside a transaction** that the store commits when it returns `Ok`.
 ///
 /// Every method receives a connection from the store's pool, and its future must be `Send`.
 pub trait Dispatcher: Send + Sync + 'static {
-    /// The values this vault stores.
+    /// The values this vault stores. `claim.store` and `claim.load` take this type, or any
+    /// type with `Into<Value>` and `TryFrom<Value>` conversions.
     type Value: Send + 'static;
 
     /// Creates or upgrades the app's tables. Run once by

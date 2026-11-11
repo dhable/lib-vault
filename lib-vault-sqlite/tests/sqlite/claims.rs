@@ -3,7 +3,6 @@
 //! and a real second process.
 
 use crate::app::{AppDispatcher, Doc};
-use futures::{AsyncReadExt, AsyncWriteExt};
 use lib_vault::io_driver::IoDriver;
 use lib_vault::{Error, Key, Vault};
 use lib_vault_memory::MemoryStore;
@@ -498,14 +497,8 @@ async fn the_claimer_works_with_any_store() {
     let v2 = Vault::new(MemoryStore::new(), SqliteClaimer::new(pool).await.unwrap());
 
     let mut c = v1.claim(Key::new("notes").unwrap()).await.unwrap();
-    let mut w = c.open_write("today.md").await.unwrap();
-    w.write_all(b"hello").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
-    let mut buf = Vec::new();
-    let mut r = c.open_read("today.md").await.unwrap();
-    r.read_to_end(&mut buf).await.unwrap();
-    drop(r);
+    c.store("today.md", b"hello".to_vec()).await.unwrap();
+    let buf: Vec<u8> = c.load("today.md").await.unwrap();
     assert_eq!(buf, b"hello");
 
     assert!(refused(&v2, "notes/today.md").await);
@@ -533,12 +526,16 @@ fn child_holds_claim() {
         .unwrap();
         let vault = Vault::new(store, claimer);
         let mut claim = vault.claim(Key::new(&k).unwrap()).await.unwrap();
-        let mut w = claim.open_write(None).await.unwrap();
-        w.put(Doc {
-            title: "from the child".into(),
-            body: String::new(),
-        });
-        w.close().await.unwrap();
+        claim
+            .store(
+                None,
+                Doc {
+                    title: "from the child".into(),
+                    body: String::new(),
+                },
+            )
+            .await
+            .unwrap();
         println!("LV_CHILD_HELD");
         tokio::time::sleep(Duration::from_secs(60)).await;
     });
@@ -591,6 +588,6 @@ async fn claims_exclude_other_processes() {
     child.wait().unwrap();
     assert!(eventually_claimable(&v, "shared").await);
     let mut c = v.claim(Key::new("shared").unwrap()).await.unwrap();
-    let doc: Doc = c.open_read(None).await.unwrap().try_as().unwrap();
+    let doc: Doc = c.load(None).await.unwrap();
     assert_eq!(doc.title, "from the child");
 }

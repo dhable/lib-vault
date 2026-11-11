@@ -659,7 +659,7 @@ root.
 | `lib-vault` | the core API: `Vault<D>`, `Claim<D>`, `Key`, the `Store<D>` / `Claimer` / `ClaimLock` traits, the I/O drivers in `io_driver`, `Error` |
 | `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<AsyncIoDriver>`, `Vec<u8>` objects, any claimer), `FsClaimer` (`FsStore` only), `FsStoreOptions`, `Sharing`, `PosixError`; requires a tokio runtime (D56) |
 | `lib-vault-memory` | the in-memory backend for tests and getting started (D51, D87): `MemoryStore` (`Vec<u8>` objects), `MemoryClaimer`, `vault()`; integration tests in `tests/` exercise the core API against it |
-| `lib-vault-sqlite` | the SQLite backend for typed values (D78, D79): `SqliteStore<D>` and its driver `SqliteDriver<D>` over an app-supplied `Dispatcher`, `SqliteReader`/`SqliteWriter`, `SqliteClaimer` and `SqliteClaimerOptions` (any store), `SqliteError`; sqlx, requires a tokio runtime; integration tests in `tests/sqlite/` against real database files |
+| `lib-vault-sqlite` | the SQLite backend for typed values (D78, D79): `SqliteStore<D>` and its driver `SqliteDriver<D>` over an app-supplied `Dispatcher` (the value type is the driver's object pointer, D89), `SqliteClaimer` and `SqliteClaimerOptions` (any store), `SqliteError`; sqlx, requires a tokio runtime; integration tests in `tests/sqlite/` against real database files |
 | `lib-vault-clickhouse` | the ClickHouse backend for typed values (D82, D83): `ClickhouseStore<D>` and its driver `ClickhouseDriver<D>` over an app-supplied `Dispatcher`, `ClickhouseReader`/`ClickhouseWriter`, `ClickhouseClaimer` and `ClickhouseClaimerOptions` (Keeper via `KeeperMap`, any store), `ClickhouseError`; requires a tokio runtime; integration tests behind the `integration-tests` feature, against `tests/docker/compose.yaml` |
 
 Modules in `lib-vault/src/`:
@@ -695,11 +695,10 @@ Modules in `lib-vault-sqlite/src/` (D78, D79):
 
 | Module | Contents |
 |---|---|
-| `lib.rs` | re-exports, crate docs with a runnable example (in-memory database) and a `compile_fail` borrow check |
+| `lib.rs` | re-exports, crate docs with a runnable example (in-memory database) |
 | `dispatch.rs` | `Dispatcher`, `DispatchError` |
-| `driver.rs` | `SqliteDriver<D>` (`IoDriver`, `IntoStorePtr`) |
-| `handles.rs` | `SqliteReader`, `SqliteWriter` |
-| `store.rs` | `SqliteStore<D>`: pooled reads, `BEGIN IMMEDIATE` writes and deletes |
+| `driver.rs` | `SqliteDriver<D>` (`IoDriver`, `IntoStorePtr`, `IntoObjectPtr`) |
+| `store.rs` | `SqliteStore<D>`: pooled `load` and `list`, `BEGIN IMMEDIATE` `store` and `delete` |
 | `claimer.rs` | `SqliteClaimer`, `SqliteClaimerOptions`, the in-process held set, the lock, and the background task (row deletion, lease renewal, shutdown) |
 | `error.rs` | `SqliteError` |
 
@@ -749,13 +748,13 @@ Modules in `lib-vault-clickhouse/src/` (D82, D83):
   - CI (D81): clippy on Linux and macOS; build and tests on Linux, macOS and Windows (without
     `lib-vault-posix`) on stable; the ClickHouse integration tests on Linux; library builds on
     each crate's MSRV (1.89, and 1.94 for `lib-vault-sqlite`).
-- **SQLite backend** (`lib-vault-sqlite/tests/sqlite/`, 29 tests against real database files,
+- **SQLite backend** (`lib-vault-sqlite/tests/sqlite/`, 28 tests against real database files,
   through an example app's `Dispatcher` in `app.rs`):
-  - done: round trips through `try_as`, `value` and `into_value`; values land in the app's typed
-    columns under full keys; migration on store creation; key forms and `None`; `NotFound`
-    with the full key; `WrongType`; commit on `close()` (dropped writers, `close` without
-    `put`, last `put` wins); overwriting with another type; `delete` and `delete(None)`;
-    component-wise `list`; scoping; the case rule via the dispatcher's unique index; dispatcher
+  - done: round trips as one of the app's types and as the value type; values land in the
+    app's typed columns under full keys; migration on store creation; key forms and `None`;
+    `NotFound` and `WrongType` with the full key; overwriting with another type; `delete` and `delete(None)`;
+    component-wise `list`; scoping; the case rule via the dispatcher's unique index, with the
+    refused `store` rolled back; dispatcher
     errors surfaced; persistence across pools; 16 concurrent writers; the store with
     `MemoryClaimer` and the claimer with `MemoryStore`. Claims: conflicts in both directions
     within a claimer and between claimers on one file; immediate in-process release and

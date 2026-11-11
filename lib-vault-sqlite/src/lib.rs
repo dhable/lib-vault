@@ -3,8 +3,8 @@
 //!
 //! The app supplies a [`Dispatcher`]: one value type for the vault (usually an enum with a
 //! variant per struct) and the code that reads, writes, deletes and lists those values on a
-//! SQLite connection. The store calls it for every operation, and `Claim` passes the typed
-//! handles through untouched.
+//! SQLite connection. The store calls it for every operation, and `Claim::store` and
+//! `Claim::load` take the app's own types.
 //!
 //! Built on sqlx, so it requires the app to run on a **tokio** runtime (like `lib-vault-posix`,
 //! D56).
@@ -116,26 +116,13 @@
 //! );
 //! let mut claim = vault.claim(Key::new("docs/a")?).await?;
 //!
-//! let mut writer = claim.open_write(None).await?;
-//! writer.put(MyDataObj { title: "hello".into() });
-//! writer.close().await?; // commits
+//! // Any type with `Into<AppValue>`; committed in a transaction.
+//! claim.store(None, MyDataObj { title: "hello".into() }).await?;
 //!
-//! let reader = claim.open_read(None).await?;
-//! let doc: MyDataObj = reader.try_as()?;
+//! // Any type with `TryFrom<AppValue>`; `Error::WrongType` if the value is another variant.
+//! let doc: MyDataObj = claim.load(None).await?;
 //! assert_eq!(doc.title, "hello");
 //! # Ok(())
-//! # }
-//! ```
-//!
-//! Handles borrow the claim, so a claim can't be released while one is open (D42):
-//!
-//! ```compile_fail
-//! # use lib_vault::Claim;
-//! # use lib_vault_sqlite::{Dispatcher, SqliteDriver};
-//! # async fn f<D: Dispatcher>(mut claim: Claim<SqliteDriver<D>>) {
-//! let reader = claim.open_read(None).await.unwrap();
-//! claim.release().unwrap(); // error: `claim` is still borrowed by `reader`
-//! drop(reader);
 //! # }
 //! ```
 
@@ -143,14 +130,12 @@ mod claimer;
 mod dispatch;
 mod driver;
 mod error;
-mod handles;
 mod store;
 
 pub use claimer::{SqliteClaimer, SqliteClaimerOptions};
 pub use dispatch::{DispatchError, Dispatcher};
 pub use driver::SqliteDriver;
 pub use error::SqliteError;
-pub use handles::{SqliteReader, SqliteWriter};
 pub use store::SqliteStore;
 
 #[cfg(test)]

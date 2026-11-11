@@ -13,16 +13,19 @@ The app implements `Dispatcher`:
   `sqlx::SqliteConnection`. Hand-written queries, SeaORM, or anything else.
 
 The vault type names the dispatcher, `Vault<SqliteDriver<AppDispatcher>>`, and the claim
-hands out typed handles:
+stores and loads the app's own types:
 
 ```rust,ignore
-let mut writer = claim.open_write(None).await?;
-writer.put(MyDataObj { title: "hello".into() }); // impl Into<AppValue>
-writer.close().await?;                           // commits in a transaction
+// Any `impl Into<AppValue>`; committed in a transaction.
+claim.store(None, MyDataObj { title: "hello".into() }).await?;
 
-let reader = claim.open_read(None).await?;       // Error::NotFound if missing
-let doc: MyDataObj = reader.try_as()?;           // TryFrom<AppValue>
+// Any `TryFrom<AppValue>`. `Error::NotFound` if missing, `Error::WrongType` if the stored
+// value is another variant.
+let doc: MyDataObj = claim.load(None).await?;
 ```
+
+`AppValue` itself works in both calls too. A type with no conversion to the value type is a
+compile error, not a run-time one.
 
 The crate docs have a complete, runnable example, and `tests/sqlite/app.rs` a fuller
 dispatcher with two record types.
@@ -30,7 +33,8 @@ dispatcher with two record types.
 The store passes keys straight through, so the dispatcher upholds the `Store` contract:
 full keys, `delete` of a missing key succeeds, `list` is component-wise and relative, and
 `write` refuses keys that differ from an existing one only by ASCII case (a unique index with
-`COLLATE NOCASE` does it). Writes and deletes run in a `BEGIN IMMEDIATE` transaction.
+`COLLATE NOCASE` does it). `store` and `delete` run in a `BEGIN IMMEDIATE` transaction, so a
+`store` that fails, or whose future is dropped, is rolled back.
 
 ## Claimer
 
