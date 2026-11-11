@@ -655,7 +655,7 @@ root.
 |---|---|
 | `lib-vault` | the core API: `Vault<D>`, `Claim<D>`, `Key`, the `Store<D>` / `Claimer` / `ClaimLock` traits, the I/O drivers in `io_driver`, `Error` |
 | `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<AsyncIoDriver>`, any claimer), `FsClaimer` (`FsStore` only), `FsStoreOptions`, `Sharing`, `PosixError`; requires a tokio runtime (D56) |
-| `lib-vault-memory` | the in-memory backend for tests and getting started (D51): `MemoryStore`, `MemoryClaimer`, `vault()`; integration tests in `tests/` exercise the core API against it |
+| `lib-vault-memory` | the in-memory backend for tests and getting started (D51, D87): `MemoryStore` (`Vec<u8>` objects), `MemoryClaimer`, `vault()`; integration tests in `tests/` exercise the core API against it |
 | `lib-vault-sqlite` | the SQLite backend for typed values (D78, D79): `SqliteStore<D>` and its driver `SqliteDriver<D>` over an app-supplied `Dispatcher`, `SqliteReader`/`SqliteWriter`, `SqliteClaimer` and `SqliteClaimerOptions` (any store), `SqliteError`; sqlx, requires a tokio runtime; integration tests in `tests/sqlite/` against real database files |
 | `lib-vault-clickhouse` | the ClickHouse backend for typed values (D82, D83): `ClickhouseStore<D>` and its driver `ClickhouseDriver<D>` over an app-supplied `Dispatcher`, `ClickhouseReader`/`ClickhouseWriter`, `ClickhouseClaimer` and `ClickhouseClaimerOptions` (Keeper via `KeeperMap`, any store), `ClickhouseError`; requires a tokio runtime; integration tests behind the `integration-tests` feature, against `tests/docker/compose.yaml` |
 
@@ -723,6 +723,8 @@ Modules in `lib-vault-clickhouse/src/` (D82, D83):
   To add: a test that an `OwnedBufDriver` store holding `!Send`
   state works through `Vault<OwnedBufDriver>`.
 - **Core, against an in-memory backend**: scoped claims can't reach outside their key (D36);
+  `store` then `load` round trips, overwrites, and `WrongType` for a stored or requested type
+  the store doesn't hold (D86, D87);
   overlapping claims conflict in both directions and disjoint ones don't (D44);
   `ClaimLock::release` runs exactly once whether the claim is released, dropped, or both, and
   `release()` returns its error; a released key can be claimed again immediately (D39); shutdown
