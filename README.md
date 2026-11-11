@@ -5,7 +5,7 @@
 Confined, exclusively claimed storage for AI harnesses: memory context, scratchpads, artifacts.
 
 An app asks a `Vault` for a `Claim` on a key such as `sessions/123`. The claim is the only way
-to read, write, list or delete objects at that key and beneath it, and no one else (another
+to load, store, list or delete objects at that key and beneath it, and no one else (another
 task, thread or process) can claim an overlapping key until it's released. Storage and locking
 are pluggable backends.
 
@@ -37,19 +37,13 @@ lib-vault-memory = { path = "lib-vault-memory" }
 ```
 
 ```rust
-use futures::{AsyncReadExt, AsyncWriteExt};
 use lib_vault::Key;
 
 let vault = lib_vault_memory::vault();
 let mut claim = vault.claim(Key::new("session")?).await?;
 
-let mut writer = claim.open_write("notes.md").await?;
-writer.write_all(b"hello").await?;
-writer.close().await?; // commit
-drop(writer);
-
-let mut text = String::new();
-claim.open_read("notes.md").await?.read_to_string(&mut text).await?;
+claim.store("notes.md", b"hello".to_vec()).await?;
+let bytes: Vec<u8> = claim.load("notes.md").await?;
 claim.release()?;
 ```
 

@@ -1,10 +1,12 @@
+use crate::io_driver::IntoObjectPtr;
 use crate::{AsKeyRef, ClaimLock, Error, Key, Store, VaultState, io_driver};
-use futures::future::{self, Either};
+use futures::future::{self, Either, FutureExt};
+use std::any::Any;
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
 /// A `Claim` provides exclusive access to objects stored at a key and any child keys. Holding
-/// a `Claim` is the only way to list, delete, read and write objects.
+/// a `Claim` is the only way to list, delete, load and store objects.
 ///
 /// `Claim` is safe to move between tasks, making it async compatable with runtimes like tokio
 /// (e.g. `Claim` implements `Send`). Although it is not possible to use a shared `Claim` for
@@ -71,33 +73,54 @@ impl<D: io_driver::IoDriver> Claim<D> {
         }
     }
 
-    /// Opens a specific object at `base` + `key` for reading. The resulting reader is valid
-    /// for the duration of the claim. Reading a key that does not point an object will return
-    /// an error. `None` means the claimed key itself.
-    pub fn open_read<'a>(
-        &'a mut self,
-        key: impl AsKeyRef,
-    ) -> impl Future<Output = Result<D::Reader<'a>, Error>> + 'a {
+    /// Loads the whole object at `base` + `key` as a `T`. Which types a vault can load depends
+    /// on its I/O driver and store: byte stores hold `Vec<u8>`, structured stores their own
+    /// values. Loading a key that does not point at an object is `Error::NotFound`; asking for
+    /// a type other than the stored one is `Error::WrongType`. `None` means the claimed key
+    /// itself.
+    ///
+    /// Example:
+    /// ```ignore
+    ///    let bytes: Vec<u8> = claim.load("notes.md").await?;
+    /// ```
+    pub fn load<T>(&mut self, key: impl AsKeyRef) -> impl Future<Output = Result<T, Error>> + '_
+    where
+        T: Any,
+        D: IntoObjectPtr<T>,
+    {
         match resolve_key(&self.base, key) {
-            Ok(key) => Either::Left(self.store.open_read(&key)),
             Err(err) => Either::Right(future::ready(Err(err))),
+            Ok(key) => {
+                let res = self.store.load(&key).map(move |res| {
+                    res.and_then(|ptr| D::from_object_ptr(ptr).ok_or(Error::WrongType { key }))
+                });
+                Either::Left(res)
+            }
         }
     }
 
-    /// Opens a specific object at `base` + `key` for writing. The specific beahviors around when
-    /// data is committed/flushed and what happens with in flight requests after the Claim is
-    /// released should be documented by the the `Store` implementation. Due to the mutable borrowing
-    /// and the lifetimes, there can only be a single open reader or writer at a given time.
+    /// Stores `data` as the whole object at `base` + `key`. Storing to a key pointing at an
+    /// existing object overwrites it; storing to a key without an object creates it. The object
+    /// is stored once the returned future resolves to `Ok`; what a failed or interrupted call
+    /// leaves behind is documented by the `Store` implementation. A type the store doesn't
+    /// hold is `Error::WrongType`. `None` means the claimed key itself.
     ///
-    /// Writing to a key pointing at an existing object should overwrite the exiting object data.
-    /// Writing to a key that does not have an object will create the object with the given key.
-    /// `None` means the claimed key itself.
-    pub fn open_write<'a>(
-        &'a mut self,
+    /// Example:
+    /// ```ignore
+    ///    claim.store("notes.md", b"hello".to_vec()).await?;
+    /// ```
+    pub fn store<T>(
+        &mut self,
         key: impl AsKeyRef,
-    ) -> impl Future<Output = Result<D::Writer<'a>, Error>> + 'a {
+        data: T,
+    ) -> impl Future<Output = Result<(), Error>> + '_
+    where
+        T: Any,
+        D: IntoObjectPtr<T>,
+    {
+        let data = D::into_object_ptr(data);
         match resolve_key(&self.base, key) {
-            Ok(key) => Either::Left(self.store.open_write(&key)),
+            Ok(key) => Either::Left(self.store.store(&key, data)),
             Err(err) => Either::Right(future::ready(Err(err))),
         }
     }
@@ -194,8 +217,8 @@ mod tests {
                     let mut c = vault.claim(Key::new("a").unwrap()).await.unwrap();
                     let _ = c.list(None).await;
                     let _ = c.delete("x").await;
-                    drop(c.open_read(&k).await);
-                    drop(c.open_write(Some(&k)).await);
+                    let _ = c.load::<Vec<u8>>(&k).await;
+                    let _ = c.store(Some(&k), Vec::<u8>::new()).await;
                 });
             }
             let _ = claim_futures_are_spawnable;
