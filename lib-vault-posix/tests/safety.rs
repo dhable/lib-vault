@@ -1,7 +1,6 @@
 //! Links, special files (D17) and the construction-time checks on the vault root (§9, D64,
 //! D70).
 
-use futures::AsyncWriteExt;
 use lib_vault::{Error, Key, Vault};
 use lib_vault_posix::{FsClaimer, FsStore, FsStoreOptions, PosixError, Sharing};
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -22,17 +21,14 @@ async fn symlinked_objects_are_refused_and_not_listed() {
     let claimer = FsClaimer::new(&store);
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-    let mut w = c.open_write("real").await.unwrap();
-    w.write_all(b"x").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store("real", b"x".to_vec()).await.unwrap();
     let outside = dir.path().join("secret");
     std::fs::write(&outside, b"outside the vault").unwrap();
     symlink(&outside, root.join("a/link")).unwrap();
 
-    let err = c.open_read("link").await.err().unwrap();
+    let err = c.load::<Vec<u8>>("link").await.err().unwrap();
     assert!(unsupported(&err), "{err:?}");
-    let err = c.open_write("link").await.err().unwrap();
+    let err = c.store("link", b"x".to_vec()).await.err().unwrap();
     assert!(unsupported(&err), "{err:?}");
     let keys = c.list(None).await.unwrap();
     assert_eq!(keys.iter().map(Key::as_str).collect::<Vec<_>>(), ["real"]);
@@ -53,9 +49,9 @@ async fn symlinked_directories_are_never_followed() {
     symlink(&outside, root.join("a/dir")).unwrap();
 
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-    let err = c.open_read("dir/f").await.err().unwrap();
+    let err = c.load::<Vec<u8>>("dir/f").await.err().unwrap();
     assert!(unsupported(&err), "{err:?}");
-    let err = c.open_write("dir/g").await.err().unwrap();
+    let err = c.store("dir/g", b"x".to_vec()).await.err().unwrap();
     assert!(unsupported(&err), "{err:?}");
     assert!(!outside.join("g").exists());
     // Claiming through the symlink fails too.
@@ -71,12 +67,9 @@ async fn hard_linked_objects_are_refused() {
     let claimer = FsClaimer::new(&store);
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-    let mut w = c.open_write("f").await.unwrap();
-    w.write_all(b"x").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store("f", b"x".to_vec()).await.unwrap();
     std::fs::hard_link(root.join("a/f"), dir.path().join("alias")).unwrap();
-    let err = c.open_read("f").await.err().unwrap();
+    let err = c.load::<Vec<u8>>("f").await.err().unwrap();
     assert!(unsupported(&err), "{err:?}");
 }
 
@@ -88,16 +81,13 @@ async fn fifos_are_refused_without_blocking() {
     let claimer = FsClaimer::new(&store);
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-    let mut w = c.open_write("f").await.unwrap(); // creates the directory
-    w.write_all(b"x").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store("f", b"x".to_vec()).await.unwrap(); // creates the directory
     let status = std::process::Command::new("mkfifo")
         .arg(root.join("a/pipe"))
         .status()
         .unwrap();
     assert!(status.success());
-    let err = c.open_read("pipe").await.err().unwrap();
+    let err = c.load::<Vec<u8>>("pipe").await.err().unwrap();
     assert!(unsupported(&err), "{err:?}");
 }
 

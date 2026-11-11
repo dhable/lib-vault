@@ -3,11 +3,10 @@
 //! `flock` across threads and processes.
 //!
 //! **Requires a tokio runtime.** Choosing this backend means the app runs on tokio (D56): its
-//! futures, readers and writers run blocking system calls on tokio's blocking pool and panic if
+//! futures run blocking system calls on tokio's blocking pool and panic if
 //! polled outside a tokio runtime. `lib-vault` itself and other backends don't need tokio.
 //!
 //! ```no_run
-//! use futures::{AsyncReadExt, AsyncWriteExt};
 //! use lib_vault::{Key, Vault};
 //! use lib_vault_posix::{FsClaimer, FsStore, FsStoreOptions};
 //!
@@ -17,13 +16,10 @@
 //! let vault = Vault::new(store, claimer);
 //! let mut claim = vault.claim(Key::new("session")?).await?;
 //!
-//! let mut writer = claim.open_write("notes.md").await?;
-//! writer.write_all(b"hello").await?;
-//! writer.close().await?; // the commit point
-//! drop(writer);
+//! claim.store("notes.md", b"hello".to_vec()).await?; // journaled, then committed
 //!
-//! let mut text = String::new();
-//! claim.open_read("notes.md").await?.read_to_string(&mut text).await?;
+//! let bytes: Vec<u8> = claim.load("notes.md").await?;
+//! assert_eq!(bytes, b"hello");
 //! claim.release()?;
 //! # Ok(()) }
 //! ```

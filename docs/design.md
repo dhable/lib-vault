@@ -502,7 +502,7 @@ memory backend stay runtime-free.
 | FIFO / socket / device node | Refuse | open `O_NONBLOCK` → `fstat` → require REG/DIR → clear `O_NONBLOCK` (a FIFO open would otherwise block) |
 | `list` entries | Classify via `fstatat(AT_SYMLINK_NOFOLLOW)`; links, specials, reserved `.vault*` files and names that aren't valid keys are skipped and never traversed | |
 | `delete` | Removes only the regular file at the key (`unlinkat` via the parent handle); directories, links and specials are left alone | |
-| Existing object on `open_write` | Same handle checks as a read, done up front even though the journal defers touching the object | |
+| Existing object on `store` | Same handle checks as a `load`, done up front even though the journal defers touching the object | |
 | Modes | Never set exec/setuid/setgid. Files `0600`, dirs `0700` (`0660` / `2770` in group-sharing mode, §9) | explicit `fchmod` after create, independent of umask |
 
 Windows (later): reject reparse points (symlinks, junctions, mount points), alternate data streams
@@ -543,7 +543,7 @@ Correctness:
 - **Aliasing**: on a case-insensitive filesystem `.vault-lock-Notes` and `.vault-lock-notes` are the same file, so they get the same lock. Hard links are refused. If an outsider renames or deletes a lock file, verify-after-lock (step 3) catches it and the claimant retries.
 
 Rules and consequences:
-- **Create on write** (D67): the claim locks the key's lock file, so the object doesn't need to exist. It's created by the first `open_write`; claiming and releasing a missing key leaves no object (only intermediate directories, which aren't objects). **File claims** are allowed: the exclusive lock is on that key's lock file only, not its parent directory (D59).
+- **Create on write** (D67): the claim locks the key's lock file, so the object doesn't need to exist. It's created by the first `store`; claiming and releasing a missing key leaves no object (only intermediate directories, which aren't objects). **File claims** are allowed: the exclusive lock is on that key's lock file only, not its parent directory (D59).
 - **Deleting a claimed object** happens via the held parent fd and doesn't touch the lock file, so the claim stays held.
 - **Permissions**: every participant needs `rwx` on the directories along its claim paths (to create lock files and directories) and read access to the lock files. Otherwise the claim fails with `PermissionDenied`.
 - **Nested vault roots are not allowed** (D72): a vault root must not sit inside another vault's tree, or contain one. This is documented, not detected; if two vaults do nest, exclusion between them isn't guaranteed. No locks are taken above the root. `/` and system directories are refused as roots.
@@ -553,14 +553,16 @@ Rules and consequences:
 - **Fairness**: `flock` has no queueing, so waiters can starve.
 - **Filesystems** (D69): local filesystems are expected, since NFS `flock` emulation is unreliable across hosts. Construction detects others with `statfs` (`f_type` magic numbers on Linux, `MNT_LOCAL` on macOS), logs a `tracing` warning and continues.
 - **Writes and crash safety** (D19, D63): objects are written **in place**, so the inode never changes and the claim's `flock` stays on the right file. An optional journal, **on by default** and chosen when the `FsStore` is created, makes writes crash-safe:
-  1. `open_write` creates `.vault-journal-<name>` beside the object (reserved `.vault` prefix: never a key, never listed). Its header holds a magic number, the content length and a checksum, plus a completion marker.
-  2. `write` appends only to the journal; the object is untouched.
-  3. `close()` completes the header, fsyncs the journal and the directory (`F_FULLFSYNC` on macOS), truncates and rewrites the object in place, fsyncs it, unlinks the journal and fsyncs the directory. The commit point is `close()`.
-  4. A writer dropped without `close()` never touched the object; its journal is deleted (best effort).
+  1. `store` runs the checks (leftover journal, case collision, the handle checks on an existing object), then creates `.vault-journal-<name>` beside the object (reserved `.vault` prefix: never a key, never listed). Its header holds a magic number, the content length and a checksum, plus a completion marker, all zero at first.
+  2. It writes the whole object after the header; the object itself is untouched. If this fails, the journal is deleted and `store` fails.
+  3. The commit: it completes the header, fsyncs the journal and the directory (`F_FULLFSYNC` on macOS), truncates and rewrites the object in place, fsyncs it, unlinks the journal and fsyncs the directory. The object is stored, and durable, when `store` returns `Ok` (D88).
+  4. If the commit fails part-way, the journal stays: it's the only complete copy.
 
-  With journaling off, writes truncate, write in place and fsync, and a crash can leave a partial object. Journaling costs about 2× the bytes written.
-- **Leftover journal** (D63): in either mode, `open_read`/`open_write` on a key whose journal exists fail with `Error::StoreError` wrapping a posix `InterruptedWrite { key, journal }` error that names the file. Only that object is affected, and `list`/`delete` work normally. The check happens at open time; there's no scan when the store is created. Recovery is manual: copy a complete journal (valid checksum) over the object, or delete an incomplete one. The library offers no replay API.
-- **No read-only fallback** (D61): if the object can't be opened read-write (for example a different uid with read-only permission), `open_write` fails with a permission error (`StoreError` wrapping `PermissionDenied`), not `AlreadyClaimed`. Because claims lock lock files (D67), this surfaces when the object is opened, not when it's claimed.
+  The whole of `store` is one task on tokio's blocking pool (D88). Dropping the `store` future doesn't cancel the task, so a cancelled `store` still runs to completion, and the object ends up whole: old or new, never partial.
+
+  With journaling off, `store` truncates, writes in place and fsyncs, and a crash can leave a partial object. Journaling costs about 2× the bytes written.
+- **Leftover journal** (D63): in either mode, `load`/`store` on a key whose journal exists fail with `Error::StoreError` wrapping a posix `InterruptedWrite { key, journal }` error that names the file. Only that object is affected, and `list`/`delete` work normally. The check happens on each `load` and `store`; there's no scan when the store is created. Recovery is manual: copy a complete journal (valid checksum) over the object, or delete an incomplete one. The library offers no replay API.
+- **No read-only fallback** (D61): if the object can't be opened read-write (for example a different uid with read-only permission), `store` fails with a permission error (`StoreError` wrapping `PermissionDenied`), not `AlreadyClaimed`. Because claims lock lock files (D67), this surfaces when the object is stored, not when it's claimed.
 - **Windows (later)**: `LockFileEx` can't lock directories. Candidate: directory handles opened with share modes (`FILE_SHARE_READ` = shared, no sharing = exclusive).
 
 ## 9. OS-level security (filesystem backend)
@@ -638,7 +640,8 @@ Async is the base API (D33), not a later addition. Notes carried over from the o
   released, including on `Drop`, or exclusion is broken. An operation's future borrows the
   claim (§4.3), so it's awaited or dropped before the claim is released; a backend whose
   cancelled `store` keeps running in the background must still finish it before its
-  `ClaimLock::release` returns `Ok`.
+  `ClaimLock::release` returns `Ok`. `lib-vault-posix` doesn't yet: a `store` whose future was
+  dropped can still be writing when the claim is released (P67).
 - **Cancellation**: dropping a `claim()` future must release any partially acquired locks.
 - **Blocking work**: each backend picks its runtime and documents it; `lib-vault-posix` uses the
   app's tokio runtime (`spawn_blocking`, D56).
@@ -654,7 +657,7 @@ root.
 | Crate | Contents |
 |---|---|
 | `lib-vault` | the core API: `Vault<D>`, `Claim<D>`, `Key`, the `Store<D>` / `Claimer` / `ClaimLock` traits, the I/O drivers in `io_driver`, `Error` |
-| `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<AsyncIoDriver>`, any claimer), `FsClaimer` (`FsStore` only), `FsStoreOptions`, `Sharing`, `PosixError`; requires a tokio runtime (D56) |
+| `lib-vault-posix` | the filesystem backend (§8, D73): `FsStore` (`Store<AsyncIoDriver>`, `Vec<u8>` objects, any claimer), `FsClaimer` (`FsStore` only), `FsStoreOptions`, `Sharing`, `PosixError`; requires a tokio runtime (D56) |
 | `lib-vault-memory` | the in-memory backend for tests and getting started (D51, D87): `MemoryStore` (`Vec<u8>` objects), `MemoryClaimer`, `vault()`; integration tests in `tests/` exercise the core API against it |
 | `lib-vault-sqlite` | the SQLite backend for typed values (D78, D79): `SqliteStore<D>` and its driver `SqliteDriver<D>` over an app-supplied `Dispatcher`, `SqliteReader`/`SqliteWriter`, `SqliteClaimer` and `SqliteClaimerOptions` (any store), `SqliteError`; sqlx, requires a tokio runtime; integration tests in `tests/sqlite/` against real database files |
 | `lib-vault-clickhouse` | the ClickHouse backend for typed values (D82, D83): `ClickhouseStore<D>` and its driver `ClickhouseDriver<D>` over an app-supplied `Dispatcher`, `ClickhouseReader`/`ClickhouseWriter`, `ClickhouseClaimer` and `ClickhouseClaimerOptions` (Keeper via `KeeperMap`, any store), `ClickhouseError`; requires a tokio runtime; integration tests behind the `integration-tests` feature, against `tests/docker/compose.yaml` |
@@ -677,7 +680,7 @@ Modules in `lib-vault-posix/src/`:
 | Module | Contents |
 |---|---|
 | `lib.rs` | re-exports, crate docs (choosing a claimer) |
-| `store.rs` | `FsStore`: list, delete, open, the buffered writer and the commit |
+| `store.rs` | `FsStore`: list, delete, load, and store with its journal and commit |
 | `claimer.rs` | `FsClaimer`: lock-file v1 with verify-after-lock (D67, D66) |
 | `root.rs` | root opening and the construction checks (§9) |
 | `fsops.rs` | handle-relative opens and `fstat` checks (§8.1, §8.2), reserved names, fsync |
@@ -732,9 +735,10 @@ Modules in `lib-vault-clickhouse/src/` (D82, D83):
   dropped (including inside an executor and on another thread), and isn't blocked by a refused
   or cancelled claim; several tasks awaiting `shutdown` all finish.
 - **Doc examples** compile (`cargo test --doc`), or are marked `ignore`.
-- **Filesystem backend** (`lib-vault-posix/tests/`, 35 tests, passing on macOS):
+- **Filesystem backend** (`lib-vault-posix/tests/`, 37 tests, passing on macOS):
   - done: the object semantics mirrored from the memory suite; create-on-write and lock-file
-    cleanup; journal commit, dropped writers, leftover journals with and without journaling;
+    cleanup; journal commit, a refused `store` leaving the old object and no journal, a cancelled
+    `store` still completing, leftover journals with and without journaling;
     conflicts in both directions, two stores on one root, and a **multi-process** test (the test
     binary re-runs itself as a claim holder; `kill -9` releases its locks); pre-planted
     symlinks (objects and directories), hard links and FIFOs refused; root checks (symlink,

@@ -1,6 +1,5 @@
 //! Create-on-write and lock files (D67) and the write journal (D63).
 
-use futures::{AsyncReadExt, AsyncWriteExt};
 use lib_vault::{Error, Key, Vault};
 use lib_vault_posix::{FsClaimer, FsStore, FsStoreOptions, PosixError};
 use std::path::Path;
@@ -44,7 +43,7 @@ async fn claiming_and_releasing_creates_no_object() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_committed_write_leaves_no_journal() {
+async fn a_completed_store_leaves_no_journal() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(dir.path().join("vault"), FsStoreOptions::default()).unwrap();
     let root = store.root_path().to_owned();
@@ -52,17 +51,15 @@ async fn a_committed_write_leaves_no_journal() {
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-    let mut w = c.open_write("f").await.unwrap();
-    w.write_all(b"data").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store("f", b"data".to_vec()).await.unwrap();
 
     assert!(!root.join("a/.vault-journal-f").exists());
     assert_eq!(std::fs::read(root.join("a/f")).unwrap(), b"data");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn writes_reach_the_object_only_on_close() {
+async fn a_refused_store_keeps_the_old_object_and_leaves_no_journal() {
+    // D88: a `store` refused before its commit starts never touches the object.
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(dir.path().join("vault"), FsStoreOptions::default()).unwrap();
     let root = store.root_path().to_owned();
@@ -70,24 +67,25 @@ async fn writes_reach_the_object_only_on_close() {
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-    let mut w = c.open_write("f").await.unwrap();
-    w.write_all(b"old").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store("f", b"old".to_vec()).await.unwrap();
 
-    let mut w = c.open_write("f").await.unwrap();
-    w.write_all(b"new").await.unwrap();
-    w.flush().await.unwrap();
-    // Before close: the object is untouched and the journal holds the new data.
-    assert_eq!(std::fs::read(root.join("a/f")).unwrap(), b"old");
-    assert!(root.join("a/.vault-journal-f").exists());
-    w.close().await.unwrap();
-    drop(w);
-    assert_eq!(std::fs::read(root.join("a/f")).unwrap(), b"new");
+    // Not a `Vec<u8>`: refused before anything is written.
+    assert!(matches!(
+        c.store("f", String::from("never stored")).await,
+        Err(Error::WrongType { .. })
+    ));
+    // A case collision: refused by the checks that run before the journal is created.
+    assert!(c.store("F", b"never stored".to_vec()).await.is_err());
+
+    assert!(tree(&root).iter().all(|p| !p.contains(".vault-journal-")));
+    let buf: Vec<u8> = c.load("f").await.unwrap();
+    assert_eq!(buf, b"old");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_dropped_writer_keeps_the_old_object_and_removes_its_journal() {
+async fn a_cancelled_store_still_completes() {
+    // D88: `store` runs as one task on the blocking pool, so dropping its future doesn't
+    // interrupt the write: the object ends up whole, old or new, never partial.
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(dir.path().join("vault"), FsStoreOptions::default()).unwrap();
     let root = store.root_path().to_owned();
@@ -95,21 +93,26 @@ async fn a_dropped_writer_keeps_the_old_object_and_removes_its_journal() {
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-    let mut w = c.open_write("f").await.unwrap();
-    w.write_all(b"old").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store("f", b"old".to_vec()).await.unwrap();
 
-    let mut w = c.open_write("f").await.unwrap();
-    w.write_all(b"never committed").await.unwrap();
-    drop(w);
-    assert!(!root.join("a/.vault-journal-f").exists());
+    let big = vec![7u8; 4 * 1024 * 1024];
+    {
+        let pending = c.store("f", big.clone());
+        // Polled once, so the blocking task is started, then dropped.
+        let _ = tokio::time::timeout(std::time::Duration::ZERO, pending).await;
+    }
 
-    let mut buf = Vec::new();
-    let mut r = c.open_read("f").await.unwrap();
-    r.read_to_end(&mut buf).await.unwrap();
-    drop(r);
-    assert_eq!(buf, b"old");
+    // The task finishes on its own: wait for the journal to go.
+    let journal = root.join("a/.vault-journal-f");
+    for _ in 0..500 {
+        if !journal.exists() && std::fs::read(root.join("a/f")).unwrap().len() == big.len() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!journal.exists());
+    let buf: Vec<u8> = c.load("f").await.unwrap();
+    assert!(buf == big);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -120,23 +123,17 @@ async fn a_leftover_journal_blocks_only_that_object() {
     let claimer = FsClaimer::new(&store);
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
-    let mut w = c.open_write("f").await.unwrap();
-    w.write_all(b"old").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store("f", b"old".to_vec()).await.unwrap();
 
-    let mut w = c.open_write("g").await.unwrap();
-    w.write_all(b"other").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store("g", b"other".to_vec()).await.unwrap();
 
     // Simulate a crash mid-write.
     let journal = root.join("a/.vault-journal-f");
     std::fs::write(&journal, b"partial").unwrap();
 
     for err in [
-        c.open_read("f").await.err().unwrap(),
-        c.open_write("f").await.err().unwrap(),
+        c.load::<Vec<u8>>("f").await.err().unwrap(),
+        c.store("f", b"x".to_vec()).await.err().unwrap(),
     ] {
         let Error::StoreError(e) = &err else {
             panic!("expected a store error, got {err:?}");
@@ -150,10 +147,7 @@ async fn a_leftover_journal_blocks_only_that_object() {
         }
     }
     // Other objects, list and delete are unaffected.
-    let mut buf = Vec::new();
-    let mut r = c.open_read("g").await.unwrap();
-    r.read_to_end(&mut buf).await.unwrap();
-    drop(r);
+    let buf: Vec<u8> = c.load("g").await.unwrap();
     assert_eq!(buf, b"other");
     let mut keys = c.list(None).await.unwrap();
     keys.sort();
@@ -163,20 +157,14 @@ async fn a_leftover_journal_blocks_only_that_object() {
 
     // Resolving by hand (deleting the journal) makes the key usable again.
     std::fs::remove_file(&journal).unwrap();
-    let mut w = c.open_write("f").await.unwrap();
-    w.write_all(b"fresh").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store("f", b"fresh".to_vec()).await.unwrap();
 
-    let mut buf = Vec::new();
-    let mut r = c.open_read("f").await.unwrap();
-    r.read_to_end(&mut buf).await.unwrap();
-    drop(r);
+    let buf: Vec<u8> = c.load("f").await.unwrap();
     assert_eq!(buf, b"fresh");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn without_journaling_writes_go_straight_to_the_object() {
+async fn without_journaling_stores_go_straight_to_the_object() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(
         dir.path().join("vault"),
@@ -188,18 +176,15 @@ async fn without_journaling_writes_go_straight_to_the_object() {
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-    let mut w = c.open_write("f").await.unwrap();
-    w.write_all(b"first, longer").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store("f", b"first, longer".to_vec()).await.unwrap();
 
-    let mut w = c.open_write("f").await.unwrap();
-    w.write_all(b"second").await.unwrap();
-    w.flush().await.unwrap();
-    assert!(!root.join("a/.vault-journal-f").exists());
-    // In place: truncated on open, data visible after the flush.
+    c.store("f", b"second").await.unwrap_err(); // not a `Vec<u8>`: the object is untouched
+    assert_eq!(std::fs::read(root.join("a/f")).unwrap(), b"first, longer");
+
+    c.store("f", b"second".to_vec()).await.unwrap();
+    // In place: truncated and rewritten, with no journal in between.
+    assert!(tree(&root).iter().all(|p| !p.contains(".vault-journal-")));
     assert_eq!(std::fs::read(root.join("a/f")).unwrap(), b"second");
-    w.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -211,10 +196,7 @@ async fn a_leftover_journal_is_reported_even_without_journaling() {
     let v = Vault::new(store, claimer);
     let mut c = v.claim(Key::new("a").unwrap()).await.unwrap();
 
-    let mut w = c.open_write("f").await.unwrap();
-    w.write_all(b"old").await.unwrap();
-    w.close().await.unwrap();
-    drop(w);
+    c.store("f", b"old".to_vec()).await.unwrap();
 
     std::fs::write(root.join("a/.vault-journal-f"), b"partial").unwrap();
     c.release().unwrap();
@@ -223,7 +205,7 @@ async fn a_leftover_journal_is_reported_even_without_journaling() {
     let claimer = FsClaimer::new(&store);
     let unjournaled = Vault::new(store, claimer);
     let mut c = unjournaled.claim(Key::new("a").unwrap()).await.unwrap();
-    let err = c.open_read("f").await.err().unwrap();
+    let err = c.load::<Vec<u8>>("f").await.err().unwrap();
     assert!(
         matches!(&err, Error::StoreError(e) if matches!(
             e.downcast_ref::<PosixError>(),
